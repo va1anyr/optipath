@@ -30,7 +30,7 @@ namespace OptiPather;
 // loop only resolves live node positions for drawing.
 public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 {
-    public const string Version = "2.0.6";
+    public const string Version = "2.1.2";
 
     private const string ArrowTextureKey = "optipather_arrow.png";
 
@@ -65,6 +65,21 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
     // Latest computed routes (one per active/edited search), swapped in atomically by the worker.
     private volatile List<FinderResult> mapFinderResults = new();
+
+    // Persistent atlas graph, accumulated across scans. AtlasPanel.Descriptions/Points only expose the
+    // nodes near the current camera (they are UI elements), so a single scan sees just the viewport.
+    // Merging every scan into a long-lived cache lets the search cover everywhere the camera has panned
+    // over, without it staying there. Touched ONLY by the background worker (one runs at a time), so no
+    // lock is needed; the render thread reads the published results + live Descriptions, never this cache.
+    // GraphNode is immutable per instance - a re-seen node is REPLACED with a fresh snapshot rather than
+    // mutated, so already-published results keep their own copies and the render thread never sees a tear.
+    private readonly Dictionary<Vector2i, GraphNode> cachedNodes = new();
+    private readonly Dictionary<Vector2i, HashSet<Vector2i>> cachedAdjacency = new();
+    // Set from the UI (manual Rescan) to wipe the cache on the next scan. The worker ALSO auto-wipes
+    // directly when it detects an atlas/character swap mid-scan; this flag is only the manual path.
+    private volatile bool finderClearCacheRequested = false;
+    // Published cache size, shown in the panel as a coverage readout.
+    private volatile int cachedNodeCount = 0;
 
     // Distinct content/mod tags seen on the current atlas, published by the worker for the dropdown.
     private volatile List<string> availableContentTags = new();
@@ -147,6 +162,21 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         public Color Color { get; init; } = Color.FromArgb(255, 0, 200, 255);
         public List<NearOptional> NearOptionals { get; init; } = [];
         public float Bonus { get; init; }
+        // Ordered mandatory stops for a multi-stop route; empty for a single-target search.
+        public List<RouteStop> Stops { get; init; } = [];
+        // Notes to surface in the panel (e.g. a mandatory map with no reachable instance that was skipped).
+        // Settable so a collapsed multi-stop search can delegate to the single planner yet keep its warnings.
+        public List<string> Warnings { get; set; } = [];
+    }
+
+    // One stop on a multi-stop route: the map to run, the content that matched, its 1-based order, and the
+    // cumulative hops from the frontier to reach it along the planned route.
+    private sealed class RouteStop
+    {
+        public GraphNode Node { get; init; }
+        public string MatchedContent { get; init; }
+        public int CumulativeSteps { get; init; }
+        public int Order { get; init; }
     }
 
     // A resolved optional filter plus its weight, shared across searches by Key so identical optionals
@@ -165,12 +195,20 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     {
         public int Index;
         public string Name;
-        public string MandatoryMap;
-        public string MandatoryContent;
+        // One entry = locate the closest; several = plan one route that visits them all.
+        public List<MandatoryFilter> Mandatories = new();
         public Color Color;
         public List<OptDef> Optionals = new();
         public string PinnedKey;
         public bool Fresh;
+    }
+
+    // A resolved mandatory stop: a map name and/or content/mod the route must reach, plus a display label.
+    private sealed class MandatoryFilter
+    {
+        public string Map;
+        public string Content;
+        public string Label;
     }
 
     // Hop distance from the nearest instance of an optional type to every node within the corridor radius,
@@ -338,8 +376,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             list.Add(new PresetQuery {
                 Index = i,
                 Name = string.IsNullOrWhiteSpace(p.Name) ? "(unnamed)" : p.Name.Trim(),
-                MandatoryMap = p.MandatoryMap?.Trim() ?? "",
-                MandatoryContent = p.MandatoryContent?.Trim() ?? "",
+                Mandatories = BuildMandatoryFilters(p),
                 Color = PresetColor(p, i),
                 Optionals = opts,
                 PinnedKey = pin,
@@ -348,6 +385,31 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         }
         mapFinderForceFresh = -1;
         return list;
+    }
+
+    // Resolves a preset's mandatory stops into filters, honoring the multi-entry list and falling back to the
+    // legacy single MandatoryMap/MandatoryContent. Empty entries are dropped.
+    private static List<MandatoryFilter> BuildMandatoryFilters(SearchPreset p)
+    {
+        var mands = new List<MandatoryFilter>();
+        void Add(string map, string content) {
+            bool hasMap = !string.IsNullOrWhiteSpace(map);
+            bool hasContent = !string.IsNullOrWhiteSpace(content);
+            if (!hasMap && !hasContent)
+                return;
+            string mapT = map?.Trim() ?? "";
+            string contentT = content?.Trim() ?? "";
+            string label = hasMap && hasContent ? $"{mapT} / {contentT}" : (hasContent ? contentT : mapT);
+            mands.Add(new MandatoryFilter { Map = mapT, Content = contentT, Label = label });
+        }
+
+        if (p.Mandatories != null)
+            foreach (var me in p.Mandatories)
+                if (me != null)
+                    Add(me.Map, me.Content);
+        if (mands.Count == 0)
+            Add(p.MandatoryMap, p.MandatoryContent);   // legacy single-mandatory fallback
+        return mands;
     }
 
     // Run the scan + search off the render thread; atlas reads here are read-only. The scan always runs
@@ -374,6 +436,14 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         });
     }
 
+    // Adds one directed edge to the accumulated adjacency, deduped. Worker thread only.
+    private void AddCachedEdge(Vector2i a, Vector2i b)
+    {
+        if (!cachedAdjacency.TryGetValue(a, out var set))
+            cachedAdjacency[a] = set = new HashSet<Vector2i>();
+        set.Add(b);
+    }
+
     // Scans the atlas into a private graph, runs a multi-source BFS out from your completed/unlocked maps
     // (shared by every search), builds a proximity distance field per distinct optional, then scores each
     // search's candidates and publishes one result apiece. Also publishes the content tags for the dropdown.
@@ -394,42 +464,20 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         if (descs.Count == 0)
             return;   // atlas momentarily unreadable - keep the previous result instead of blanking the panel
 
-        // Build the connection graph first (links are bidirectional) so node creation can drop coordinates
-        // that have no connections.
-        var adjacency = new Dictionary<Vector2i, List<Vector2i>>(descs.Count);
-        void AddEdge(Vector2i a, Vector2i b) {
-            if (!adjacency.TryGetValue(a, out var list))
-                adjacency[a] = list = [];
-            list.Add(b);
-        }
-        try {
-            var points = atlas.Points?.ToList() ?? [];
-            foreach (var point in points) {
-                var source = point.Source;
-                var targets = point.Targets;
-                if (targets == null)
-                    continue;
-                foreach (var target in targets) {
-                    if (target == default)
-                        continue;
-                    AddEdge(source, target);
-                    AddEdge(target, source);
-                }
-            }
-        } catch {
-            // Fall back to including every node if connections can't be read.
+        // Honor a pending cache wipe (manual rescan, or an atlas-change auto-detect).
+        if (finderClearCacheRequested) {
+            finderClearCacheRequested = false;
+            cachedNodes.Clear();
+            cachedAdjacency.Clear();
         }
 
-        // atlas.Points can read partially (e.g. right after a reload, before the atlas finishes populating),
-        // so a node with no links may just be one whose connections haven't loaded yet - NOT necessarily an
-        // ungenerated phantom (like a unique that only appears once a logbook extends the atlas). Keep every
-        // node matchable regardless, so a search never goes blank just because connections lag; phantoms are
-        // stopped from becoming bogus 0-step targets by gating the BFS seeds on having connections (below),
-        // which leaves a link-less map simply unreachable ("?") until its connections appear on a later scan.
-        bool haveConnections = adjacency.Count > 0;
-
-        var nodes = new List<GraphNode>(descs.Count);
-        var nodeByCoord = new Dictionary<Vector2i, GraphNode>(descs.Count);
+        // Snapshot the nodes visible this scan and compare against the cache to spot an atlas swap, so a stale
+        // cache is dropped before this scan is merged in. Two signals: many renamed coords (a different atlas
+        // layout), or completed maps that are suddenly incomplete - a map can never un-complete for the same
+        // character, so that means a different character is reusing the coordinate space (map names are stable
+        // across characters, so the name signal alone would miss a character swap).
+        int reseen = 0, nameMismatches = 0, visitedRegressions = 0;
+        var freshThisScan = new List<GraphNode>(descs.Count);
         foreach (var d in descs) {
             var coord = d.Coordinate;
 
@@ -449,17 +497,68 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             string name = null;
             try { name = el.Area?.Name; } catch { }
 
-            var gn = new GraphNode {
+            if (cachedNodes.TryGetValue(coord, out var old) && old != null) {
+                reseen++;
+                if (old.Name != null && name != null && !string.Equals(old.Name, name, StringComparison.Ordinal))
+                    nameMismatches++;
+                if (old.Visited && !visited)
+                    visitedRegressions++;
+            }
+
+            freshThisScan.Add(new GraphNode {
                 Coord = coord,
                 Name = name,
                 Visited = visited,
                 Unlocked = unlocked,
                 Active = active,
                 ContentTags = CollectContentTags(el)
-            };
-            nodes.Add(gn);
-            nodeByCoord[coord] = gn;
+            });
         }
+
+        if ((reseen >= 10 && nameMismatches > reseen / 2) || visitedRegressions >= 3) {
+            cachedNodes.Clear();
+            cachedAdjacency.Clear();
+        }
+
+        // Merge this scan's connections into the accumulated adjacency. Links are bidirectional and
+        // atlas.Points can read partially, so we only ever ADD edges (a HashSet dedups across scans) -
+        // which also heals partial reads over time.
+        try {
+            var points = atlas.Points?.ToList() ?? [];
+            foreach (var point in points) {
+                var source = point.Source;
+                var targets = point.Targets;
+                if (targets == null)
+                    continue;
+                foreach (var target in targets) {
+                    if (target == default)
+                        continue;
+                    AddCachedEdge(source, target);
+                    AddCachedEdge(target, source);
+                }
+            }
+        } catch {
+            // Keep whatever connections are already cached if this read fails.
+        }
+
+        // Merge the node snapshots in. A re-seen coord is replaced with its fresh snapshot (so its
+        // visited/unlocked/content stay current); coords not seen this scan are kept, which is what
+        // extends coverage past the current viewport.
+        foreach (var gn in freshThisScan)
+            cachedNodes[gn.Coord] = gn;
+        cachedNodeCount = cachedNodes.Count;
+
+        // The accumulated cache IS the working graph for this scan.
+        var nodes = cachedNodes.Values.ToList();
+        var nodeByCoord = cachedNodes;
+        var adjacency = cachedAdjacency;
+
+        // A node with no links may be a not-yet-loaded connection (atlas.Points reads partially) rather
+        // than an ungenerated phantom (a unique that only appears once a logbook extends the atlas), so
+        // every node stays matchable. Phantoms are kept from seeding bogus 0-step targets by gating the
+        // BFS seeds on having connections (below), leaving a link-less map simply unreachable ("?") until
+        // its connections appear on a later scan.
+        bool haveConnections = adjacency.Count > 0;
 
         // Publish the distinct content/mod tags and map names on this atlas so the pickers can offer them.
         var distinctTags = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -521,7 +620,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         foreach (var kv in optByKey) {
             var seeds = new List<Vector2i>();
             foreach (var n in nodes)
-                if (dist.ContainsKey(n.Coord) && MatchesFilters(n, kv.Value.Map, kv.Value.Content, out _))
+                // Skip completed maps: an optional you have already run is worth nothing to the route, so it
+                // must not seed the proximity field (otherwise a done map draws an optional ring/label and
+                // can even pull the route toward itself). Mirrors the mandatory candidate filter.
+                if (!n.Visited && dist.ContainsKey(n.Coord) && MatchesFilters(n, kv.Value.Map, kv.Value.Content, out _))
                     seeds.Add(n.Coord);
             fields[kv.Key] = BuildDistanceField(adjacency, nodeByCoord, seeds);
         }
@@ -529,15 +631,20 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         var results = new List<FinderResult>(queries.Count);
         foreach (var q in queries) {
             FinderResult prevResult = previous?.FirstOrDefault(r => r.PresetIndex == q.Index);
-            results.Add(ComputePresetResult(q, nodes, dist, prev, nodeByCoord, fields, radius, maxExtra, hysteresis, prevResult));
+            results.Add(ComputePresetResult(q, nodes, dist, prev, nodeByCoord, adjacency, fields, radius, maxExtra, hysteresis, prevResult));
         }
+
+        // If a cache wipe was requested while this scan was already running, these results were computed from
+        // the stale graph - don't publish them; the next dispatch will clear and rebuild.
+        if (finderClearCacheRequested)
+            return;
 
         mapFinderResults = results;
     }
 
     // Multi-source BFS out from a set of optional instances, capped at the corridor radius. Each reached
     // node records the distance to, and identity of, its nearest seeding instance.
-    private static DistanceField BuildDistanceField(Dictionary<Vector2i, List<Vector2i>> adjacency, Dictionary<Vector2i, GraphNode> nodeByCoord, IEnumerable<Vector2i> seeds)
+    private static DistanceField BuildDistanceField(Dictionary<Vector2i, HashSet<Vector2i>> adjacency, Dictionary<Vector2i, GraphNode> nodeByCoord, IEnumerable<Vector2i> seeds)
     {
         var fieldDist = new Dictionary<Vector2i, int>();
         var source = new Dictionary<Vector2i, Vector2i>();
@@ -574,17 +681,29 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         return new DistanceField { Dist = fieldDist, Source = source, Parent = parent, SeedCount = seedCount };
     }
 
-    // Picks which instance of a search's mandatory type to recommend. Among matches within the extra-hop
-    // budget, the chosen one minimizes EffectiveSteps = steps - optionalBonus, where each optional's bonus
-    // fades linearly with how far it sits from the route and the total is capped by the budget. A pinned
-    // map always wins; near-ties are held steady by hysteresis so the recommendation doesn't flicker.
-    private static FinderResult ComputePresetResult(PresetQuery q, List<GraphNode> nodes, Dictionary<Vector2i, int> dist, Dictionary<Vector2i, Vector2i> prev, Dictionary<Vector2i, GraphNode> nodeByCoord, Dictionary<string, DistanceField> fields, int radius, int maxExtra, float hysteresis, FinderResult prevResult)
+    // Dispatches a search to the right planner: no mandatory -> empty; one -> point to the closest matching
+    // instance; several -> plan a single route that visits them all (best instance + order).
+    private static FinderResult ComputePresetResult(PresetQuery q, List<GraphNode> nodes, Dictionary<Vector2i, int> dist, Dictionary<Vector2i, Vector2i> prev, Dictionary<Vector2i, GraphNode> nodeByCoord, Dictionary<Vector2i, HashSet<Vector2i>> adjacency, Dictionary<string, DistanceField> fields, int radius, int maxExtra, float hysteresis, FinderResult prevResult)
+    {
+        if (q.Mandatories == null || q.Mandatories.Count == 0)
+            return new FinderResult { PresetIndex = q.Index, PresetName = q.Name, Color = q.Color };
+        if (q.Mandatories.Count >= 2)
+            return ComputeMultiStopRoute(q, nodes, dist, prev, nodeByCoord, adjacency, fields, radius, maxExtra, hysteresis, prevResult);
+        return ComputeSingleResult(q, nodes, dist, prev, nodeByCoord, fields, radius, maxExtra, hysteresis, prevResult);
+    }
+
+    // Picks which instance of the search's single mandatory type to recommend. Among matches within the
+    // extra-hop budget, the chosen one minimizes EffectiveSteps = steps - optionalBonus, where each
+    // optional's bonus fades linearly with how far it sits from the route and the total is capped by the
+    // budget. A pinned map always wins; near-ties are held by hysteresis so the recommendation doesn't flicker.
+    private static FinderResult ComputeSingleResult(PresetQuery q, List<GraphNode> nodes, Dictionary<Vector2i, int> dist, Dictionary<Vector2i, Vector2i> prev, Dictionary<Vector2i, GraphNode> nodeByCoord, Dictionary<string, DistanceField> fields, int radius, int maxExtra, float hysteresis, FinderResult prevResult)
     {
         var empty = new FinderResult { PresetIndex = q.Index, PresetName = q.Name, Color = q.Color };
 
+        var mand = q.Mandatories[0];
         var matches = new List<FinderMatch>();
         foreach (var n in nodes) {
-            if (n.Visited || !MatchesFilters(n, q.MandatoryMap, q.MandatoryContent, out string matchedContent))
+            if (n.Visited || !MatchesFilters(n, mand.Map, mand.Content, out string matchedContent))
                 continue;
             matches.Add(new FinderMatch {
                 Node = n,
@@ -688,17 +807,419 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         };
     }
 
-    // Scores one candidate against the optionals and, for every optional, records an outcome (match count,
-    // gap, in/out of range, nearest instance, detour) so the result can be both drawn and explained. The
-    // bonus is the sum of each in-range optional's linearly-decaying reward, capped by the extra-hop budget.
+    // Plans a single route from your completed/unlocked frontier that visits one instance of EVERY mandatory
+    // map/content, choosing which instance of each and the visiting order to minimize total hops. Optionals
+    // nudge the chosen instances (a local-search swap toward more optional-proximity). Groups with no
+    // reachable instance are skipped with a warning. The accumulated atlas graph can hold more than one
+    // disconnected region, so the plan is confined to the single connected component that satisfies the most
+    // mandatory groups; any group whose only instances sit in another region is reported, not silently dropped.
+    private static FinderResult ComputeMultiStopRoute(PresetQuery q, List<GraphNode> nodes, Dictionary<Vector2i, int> dist, Dictionary<Vector2i, Vector2i> prev, Dictionary<Vector2i, GraphNode> nodeByCoord, Dictionary<Vector2i, HashSet<Vector2i>> adjacency, Dictionary<string, DistanceField> fields, int radius, int maxExtra, float hysteresis, FinderResult prevResult)
+    {
+        const int MaxCandidatesPerGroup = 4;   // keep the nearest few instances of each mandatory type
+        const int MaxDpGroups = 8;             // exact Held-Karp up to this many groups, greedy beyond
+        const int INF = int.MaxValue / 4;
+
+        var warnings = new List<string>();
+
+        // Candidate instances per mandatory group: unvisited, matching, and reachable from the frontier.
+        var groupCands = new List<List<FinderMatch>>();
+        var groupFilters = new List<MandatoryFilter>();
+        foreach (var mf in q.Mandatories) {
+            var cands = new List<FinderMatch>();
+            foreach (var n in nodes) {
+                if (n.Visited)
+                    continue;
+                if (!MatchesFilters(n, mf.Map, mf.Content, out string mc))
+                    continue;
+                if (!dist.TryGetValue(n.Coord, out int s))
+                    continue;
+                cands.Add(new FinderMatch { Node = n, Steps = s, MatchedContent = mc });
+            }
+            cands = cands
+                .OrderBy(c => c.Steps)
+                .ThenBy(c => c.Node.Name ?? "", StringComparer.OrdinalIgnoreCase)
+                .Take(MaxCandidatesPerGroup)
+                .ToList();
+            if (cands.Count == 0)
+                warnings.Add($"{mf.Label}: no reachable map matches - skipped");
+            else { groupCands.Add(cands); groupFilters.Add(mf); }
+        }
+
+        if (groupCands.Count == 0)
+            return new FinderResult { PresetIndex = q.Index, PresetName = q.Name, Color = q.Color, Warnings = warnings };
+
+        // Flatten candidates, remembering each one's group.
+        var cand = new List<FinderMatch>();
+        var candGroup = new List<int>();
+        for (int g = 0; g < groupCands.Count; g++)
+            foreach (var c in groupCands[g]) { cand.Add(c); candGroup.Add(g); }
+        int C = cand.Count;
+        int m = groupCands.Count;
+
+        // BFS from each candidate, so we know candidate-candidate hop distances and can rebuild each leg.
+        var candDist = new Dictionary<Vector2i, int>[C];
+        var candPrev = new Dictionary<Vector2i, Vector2i>[C];
+        for (int i = 0; i < C; i++) {
+            var (cd, cp) = BfsFrom(cand[i].Node.Coord, adjacency, nodeByCoord);
+            candDist[i] = cd;
+            candPrev[i] = cp;
+        }
+
+        int Start(int j) => cand[j].Steps;                                              // frontier -> j
+        int Hop(int i, int j) => candDist[i].TryGetValue(cand[j].Node.Coord, out int d) ? d : INF;  // i -> j
+
+        // Group candidates into connected components (undirected reachability) and plan within the single
+        // component that covers the most mandatory groups - so a stop in a different atlas region is never
+        // silently dropped or stitched in with a nonsense hop. Ties break toward the nearer component.
+        var uf = new int[C];
+        for (int i = 0; i < C; i++) uf[i] = i;
+        int Find(int x) { while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; } return x; }
+        for (int i = 0; i < C; i++)
+            for (int j = i + 1; j < C; j++)
+                if (Hop(i, j) < INF) uf[Find(i)] = Find(j);
+
+        var compCands = new Dictionary<int, List<int>>();
+        var compGroups = new Dictionary<int, HashSet<int>>();
+        for (int i = 0; i < C; i++) {
+            int r = Find(i);
+            if (!compCands.TryGetValue(r, out var cl)) { compCands[r] = cl = new(); compGroups[r] = new(); }
+            cl.Add(i);
+            compGroups[r].Add(candGroup[i]);
+        }
+
+        int bestRoot = -1, bestGroups = -1, bestNearest = INF;
+        foreach (var kv in compCands) {
+            int groups = compGroups[kv.Key].Count;
+            int nearest = kv.Value.Min(Start);
+            if (groups > bestGroups || (groups == bestGroups && nearest < bestNearest)) {
+                bestGroups = groups; bestNearest = nearest; bestRoot = kv.Key;
+            }
+        }
+
+        var chosenCands = compCands[bestRoot];
+        var coveredGroups = compGroups[bestRoot];
+        for (int g = 0; g < m; g++)
+            if (!coveredGroups.Contains(g))
+                warnings.Add($"{groupFilters[g].Label}: reachable, but in a separate atlas region - not on this route");
+
+        // A search that collapses to a single reachable, connected mandatory is really a single-target search;
+        // hand it to that planner so the panel keeps its ranked table, pinning and hysteresis.
+        if (coveredGroups.Count == 1) {
+            int onlyGroup = coveredGroups.First();
+            var singleQ = new PresetQuery {
+                Index = q.Index, Name = q.Name, Color = q.Color,
+                Mandatories = new() { groupFilters[onlyGroup] },
+                Optionals = q.Optionals, PinnedKey = q.PinnedKey, Fresh = q.Fresh,
+            };
+            var single = ComputeSingleResult(singleQ, nodes, dist, prev, nodeByCoord, fields, radius, maxExtra, hysteresis, prevResult);
+            if (warnings.Count > 0)
+                single.Warnings = warnings;
+            return single;
+        }
+
+        // Solve over the chosen component only: remap its candidates + groups to a compact sub-problem.
+        var gmap = new Dictionary<int, int>();
+        foreach (int g in coveredGroups.OrderBy(x => x))
+            gmap[g] = gmap.Count;
+        var sub = chosenCands;                              // sub index -> original candidate index
+        int subC = sub.Count;
+        int subM = gmap.Count;
+        var subGroup = new List<int>(subC);
+        foreach (int oi in sub) subGroup.Add(gmap[candGroup[oi]]);
+        int SubStart(int si) => Start(sub[si]);
+        int SubHop(int si, int sj) => Hop(sub[si], sub[sj]);
+
+        List<int> subOrder = (subM <= MaxDpGroups)
+            ? SolveHeldKarp(subC, subM, subGroup, SubStart, SubHop, INF)
+            : SolveGreedyRoute(subC, subM, subGroup, SubStart, SubHop, INF);
+        if (subOrder == null || subOrder.Count == 0)
+            subOrder = SolveGreedyRoute(subC, subM, subGroup, SubStart, SubHop, INF);
+
+        var order = new List<int>(subOrder.Count);
+        foreach (int si in subOrder) order.Add(sub[si]);
+
+        // Optionals nudge: swap a stop's instance for another of the same group when it lowers the effective
+        // total (raw hops minus optional bonus). The visiting order is left as planned.
+        order = ApplyOptionalNudge(order, candGroup, cand, candPrev, prev, nodeByCoord, fields, q.Optionals, radius, maxExtra, Start, Hop, INF);
+
+        // Build the full node path: frontier -> stop1 -> stop2 -> ... concatenating each leg.
+        var fullPath = BuildRoutePath(order, cand, candPrev, prev, nodeByCoord);
+
+        // Score optionals over the whole route, and build the ordered stop list with cumulative hops. A single
+        // map that satisfies two mandatories (e.g. a Crypt that also carries Breach) is merged into one stop.
+        ScoreOptionalsForPath(fullPath, q.Optionals, fields, nodeByCoord, radius, maxExtra, out float bonus, out var near);
+
+        var stops = new List<RouteStop>();
+        var stopMatches = new List<FinderMatch>();
+        var stopByCoord = new Dictionary<Vector2i, int>();
+        int cum = Start(order[0]);
+        for (int p = 0; p < order.Count; p++) {
+            if (p > 0)
+                cum += Hop(order[p - 1], order[p]);
+            var c = cand[order[p]];
+            if (stopByCoord.TryGetValue(c.Node.Coord, out int idx)) {
+                var ex = stops[idx];
+                stops[idx] = new RouteStop {
+                    Node = ex.Node,
+                    MatchedContent = MergeContent(ex.MatchedContent, c.MatchedContent),
+                    CumulativeSteps = ex.CumulativeSteps,
+                    Order = ex.Order,
+                };
+                continue;
+            }
+            stopByCoord[c.Node.Coord] = stops.Count;
+            stops.Add(new RouteStop { Node = c.Node, MatchedContent = c.MatchedContent, CumulativeSteps = cum, Order = stops.Count + 1 });
+            stopMatches.Add(c);
+        }
+
+        return new FinderResult {
+            Matches = stopMatches,
+            Target = stops[0].Node,
+            Path = fullPath,
+            Steps = cum,
+            TargetContent = stops[0].MatchedContent,
+            PresetIndex = q.Index,
+            PresetName = q.Name,
+            Color = q.Color,
+            NearOptionals = near ?? new(),
+            Bonus = bonus,
+            Stops = stops,
+            Warnings = warnings,
+        };
+    }
+
+    // Combines two matched-content labels for a map that satisfies more than one mandatory requirement.
+    private static string MergeContent(string a, string b)
+    {
+        if (string.IsNullOrEmpty(a)) return b;
+        if (string.IsNullOrEmpty(b)) return a;
+        if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)) return a;
+        return $"{a} + {b}";
+    }
+
+    // Exact shortest route visiting one candidate from each group, via a Held-Karp DP over the group set.
+    // State dp[mask, j] = least hops from the frontier visiting exactly the groups in mask and ending at
+    // candidate j (whose group is mask's most-recently-added bit). Returns the candidate indices in order.
+    private static List<int> SolveHeldKarp(int C, int m, List<int> candGroup, Func<int, int> start, Func<int, int, int> hop, int INF)
+    {
+        int full = (1 << m) - 1;
+        var dp = new int[1 << m, C];
+        var par = new int[1 << m, C];
+        for (int mask = 0; mask <= full; mask++)
+            for (int j = 0; j < C; j++) { dp[mask, j] = INF; par[mask, j] = -1; }
+
+        for (int j = 0; j < C; j++) {
+            int gm = 1 << candGroup[j];
+            int s = start(j);
+            if (s < dp[gm, j]) { dp[gm, j] = s; par[gm, j] = -1; }
+        }
+
+        for (int mask = 1; mask <= full; mask++) {
+            for (int j = 0; j < C; j++) {
+                int dcur = dp[mask, j];
+                if (dcur >= INF)
+                    continue;
+                if ((mask & (1 << candGroup[j])) == 0)
+                    continue;
+                for (int j2 = 0; j2 < C; j2++) {
+                    int g2 = candGroup[j2];
+                    if ((mask & (1 << g2)) != 0)
+                        continue;
+                    int h = hop(j, j2);
+                    if (h >= INF)
+                        continue;
+                    int nmask = mask | (1 << g2);
+                    int nd = dcur + h;
+                    if (nd < dp[nmask, j2]) { dp[nmask, j2] = nd; par[nmask, j2] = j; }
+                }
+            }
+        }
+
+        int bestJ = -1, best = INF;
+        for (int j = 0; j < C; j++)
+            if (dp[full, j] < best) { best = dp[full, j]; bestJ = j; }
+        if (bestJ < 0)
+            return null;
+
+        var order = new List<int>();
+        int curMask = full, cur = bestJ, guard = 0;
+        while (cur != -1) {
+            order.Add(cur);
+            int p = par[curMask, cur];
+            curMask ^= (1 << candGroup[cur]);
+            cur = p;
+            if (++guard > 1000)
+                break;
+        }
+        order.Reverse();
+        return order;
+    }
+
+    // Greedy fallback for many groups: from the frontier, repeatedly hop to the nearest candidate of a group
+    // not yet visited. Not optimal but always finite (all reachable candidates share one component).
+    private static List<int> SolveGreedyRoute(int C, int m, List<int> candGroup, Func<int, int> start, Func<int, int, int> hop, int INF)
+    {
+        var order = new List<int>();
+        var usedGroups = new HashSet<int>();
+        int current = -1;
+
+        while (usedGroups.Count < m) {
+            int bestJ = -1, best = INF;
+            for (int j = 0; j < C; j++) {
+                if (usedGroups.Contains(candGroup[j]))
+                    continue;
+                int d = current < 0 ? start(j) : hop(current, j);
+                if (d < best) { best = d; bestJ = j; }
+            }
+            if (bestJ < 0)
+                break;
+            order.Add(bestJ);
+            usedGroups.Add(candGroup[bestJ]);
+            current = bestJ;
+        }
+        return order;
+    }
+
+    // Local search nudge: for each stop, try replacing its instance with another candidate of the same group
+    // and keep the swap when the route's effective cost (raw hops minus optional bonus) drops. Order fixed.
+    private static List<int> ApplyOptionalNudge(List<int> order, List<int> candGroup, List<FinderMatch> cand, Dictionary<Vector2i, Vector2i>[] candPrev, Dictionary<Vector2i, Vector2i> frontierPrev, Dictionary<Vector2i, GraphNode> nodeByCoord, Dictionary<string, DistanceField> fields, List<OptDef> opts, int radius, int maxExtra, Func<int, int> start, Func<int, int, int> hop, int INF)
+    {
+        if (opts == null || opts.Count == 0 || order.Count == 0)
+            return order;
+
+        var byGroup = new Dictionary<int, List<int>>();
+        for (int j = 0; j < cand.Count; j++) {
+            if (!byGroup.TryGetValue(candGroup[j], out var l))
+                byGroup[candGroup[j]] = l = new List<int>();
+            l.Add(j);
+        }
+
+        float Effective(List<int> seq) {
+            int raw = RouteRawHops(seq, start, hop, INF);
+            if (raw >= INF)
+                return INF;
+            var path = BuildRoutePath(seq, cand, candPrev, frontierPrev, nodeByCoord);
+            ScoreOptionalsForPath(path, opts, fields, nodeByCoord, radius, maxExtra, out float bonus, out _);
+            return raw - bonus;
+        }
+
+        var best = new List<int>(order);
+        float bestEff = Effective(best);
+
+        for (int pass = 0; pass < 3; pass++) {
+            bool improved = false;
+            for (int p = 0; p < best.Count; p++) {
+                if (!byGroup.TryGetValue(candGroup[best[p]], out var alts))
+                    continue;
+                foreach (int alt in alts) {
+                    if (alt == best[p])
+                        continue;
+                    var trial = new List<int>(best);
+                    trial[p] = alt;
+                    float eff = Effective(trial);
+                    if (eff < bestEff - 0.001f) {
+                        best = trial;
+                        bestEff = eff;
+                        improved = true;
+                    }
+                }
+            }
+            if (!improved)
+                break;
+        }
+        return best;
+    }
+
+    // Total raw hops of an ordered candidate sequence: frontier -> first, then stop to stop. INF if a leg is
+    // unreachable (should not happen for same-component candidates, but guarded).
+    private static int RouteRawHops(List<int> seq, Func<int, int> start, Func<int, int, int> hop, int INF)
+    {
+        if (seq.Count == 0)
+            return 0;
+        int total = start(seq[0]);
+        for (int p = 0; p < seq.Count - 1; p++) {
+            int h = hop(seq[p], seq[p + 1]);
+            if (h >= INF)
+                return INF;
+            total += h;
+        }
+        return total;
+    }
+
+    // Concatenates the route's legs into one node path: frontier -> first stop (via the shared frontier BFS),
+    // then each stop -> the next (via the FROM stop's own BFS). The duplicated junction node is dropped.
+    private static List<GraphNode> BuildRoutePath(List<int> order, List<FinderMatch> cand, Dictionary<Vector2i, Vector2i>[] candPrev, Dictionary<Vector2i, Vector2i> frontierPrev, Dictionary<Vector2i, GraphNode> nodeByCoord)
+    {
+        var path = new List<GraphNode>();
+        if (order.Count == 0)
+            return path;
+
+        // Drops a node that repeats the previous one - the duplicated junction between two legs, or a 0-hop
+        // leg between two co-located stops (one map satisfying two mandatories).
+        void AddNode(GraphNode n) {
+            if (n == null)
+                return;
+            if (path.Count > 0 && path[^1] != null && path[^1].Coord == n.Coord)
+                return;
+            path.Add(n);
+        }
+
+        foreach (var n in ReconstructFinderPath(cand[order[0]].Node.Coord, frontierPrev, nodeByCoord))
+            AddNode(n);
+
+        for (int p = 0; p < order.Count - 1; p++) {
+            var leg = ReconstructFinderPath(cand[order[p + 1]].Node.Coord, candPrev[order[p]], nodeByCoord);
+            foreach (var n in leg)
+                AddNode(n);
+        }
+        return path;
+    }
+
+    // Single-source BFS over the accumulated graph, returning hop distances and parent pointers from src.
+    private static (Dictionary<Vector2i, int> dist, Dictionary<Vector2i, Vector2i> prev) BfsFrom(Vector2i src, Dictionary<Vector2i, HashSet<Vector2i>> adjacency, Dictionary<Vector2i, GraphNode> nodeByCoord)
+    {
+        var dist = new Dictionary<Vector2i, int>();
+        var prev = new Dictionary<Vector2i, Vector2i>();
+        if (!nodeByCoord.ContainsKey(src))
+            return (dist, prev);
+
+        var queue = new Queue<Vector2i>();
+        dist[src] = 0;
+        queue.Enqueue(src);
+        while (queue.Count > 0) {
+            var coord = queue.Dequeue();
+            int d = dist[coord];
+            if (!adjacency.TryGetValue(coord, out var neighbors))
+                continue;
+            foreach (var next in neighbors) {
+                if (next == default || !nodeByCoord.ContainsKey(next))
+                    continue;
+                if (!dist.TryAdd(next, d + 1))
+                    continue;
+                prev[next] = coord;
+                queue.Enqueue(next);
+            }
+        }
+        return (dist, prev);
+    }
+
+    // Scores a single candidate: reconstructs its route from the frontier, then scores the optionals along it.
     private static void ScoreCandidate(FinderMatch m, List<OptDef> opts, Dictionary<string, DistanceField> fields, Dictionary<Vector2i, Vector2i> prev, Dictionary<Vector2i, GraphNode> nodeByCoord, int radius, int maxExtra, out float bonus, out List<NearOptional> near)
+    {
+        var path = ReconstructFinderPath(m.Node.Coord, prev, nodeByCoord);
+        ScoreOptionalsForPath(path, opts, fields, nodeByCoord, radius, maxExtra, out bonus, out near);
+    }
+
+    // Scores a concrete route path against the optionals and, for every optional, records an outcome (match
+    // count, gap, in/out of range, nearest instance, detour) so the result can be both drawn and explained.
+    // The bonus sums each in-range optional's linearly-decaying reward, capped by the extra-hop budget.
+    // Shared by the single-target and multi-stop planners.
+    private static void ScoreOptionalsForPath(List<GraphNode> path, List<OptDef> opts, Dictionary<string, DistanceField> fields, Dictionary<Vector2i, GraphNode> nodeByCoord, int radius, int maxExtra, out float bonus, out List<NearOptional> near)
     {
         bonus = 0f;
         near = new List<NearOptional>();
         if (opts == null || opts.Count == 0)
             return;
-
-        var path = ReconstructFinderPath(m.Node.Coord, prev, nodeByCoord);
 
         foreach (var opt in opts) {
             fields.TryGetValue(opt.Key, out var field);
@@ -999,30 +1520,42 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 descByCoord[d.Coordinate] = d;
         } catch { return; }
 
+        // Fit the atlas coord->screen transform from the on-screen nodes, so off-screen targets (cached but
+        // not currently rendered) can still be pointed at. The fit reads each sampled node's screen rect
+        // (a per-call game-memory walk), so only pay for it when it can actually be used: far arrows enabled
+        // AND at least one drawn target is genuinely off screen. Checking "off screen" is a free dictionary
+        // lookup (a live element exists iff the coord is in descByCoord) - no rect read. In the common case
+        // every target is on screen, so the fit is skipped entirely and an invalid (unused) transform passes.
+        AtlasTransform transform = default;   // Valid == false
+        if (Settings.ShowArrow && Settings.ShowFarArrows) {
+            bool anyOffScreen = false;
+            foreach (var r in drawList) {
+                var tg = r.Target;
+                if (tg != null && !tg.Visited && !descByCoord.ContainsKey(tg.Coord)) {
+                    anyOffScreen = true;
+                    break;
+                }
+            }
+            if (anyOffScreen)
+                transform = FitAtlasTransform(descByCoord);
+        }
+
         bool labelWithName = drawList.Count > 1;
         foreach (var route in drawList)
-            DrawSingleRoute(route, descByCoord, labelWithName);
+            DrawSingleRoute(route, descByCoord, transform, labelWithName);
     }
 
-    private void DrawSingleRoute(FinderResult route, Dictionary<Vector2i, AtlasNodeDescription> descByCoord, bool labelWithName)
+    private void DrawSingleRoute(FinderResult route, Dictionary<Vector2i, AtlasNodeDescription> descByCoord, AtlasTransform transform, bool labelWithName)
     {
         var target = route.Target;
         if (target == null || target.Visited)
             return;
-        if (!descByCoord.TryGetValue(target.Coord, out var targetDesc))
-            return;
-
-        RectangleF targetRect;
-        try { targetRect = targetDesc.Element.GetClientRect(); }
-        catch { return; }
 
         Color color = route.Color;
-        Vector2 targetCenter = targetRect.Center;
         string prefix = labelWithName && !string.IsNullOrEmpty(route.PresetName) ? $"[{route.PresetName}] " : "";
-        string targetName = target.Name ?? "(unknown)";
-        string targetDescription = route.TargetContent != null ? $"{targetName} - {route.TargetContent}" : targetName;
-        string targetLabel = route.Steps >= 0 ? $"{prefix}{targetDescription} ({route.Steps} steps)" : $"{prefix}{targetDescription}";
+        bool multi = route.Stops != null && route.Stops.Count > 0;
 
+        // Path line - the full itinerary for a multi-stop route. Only segments with both ends on screen draw.
         if (Settings.ShowPath && route.Path is { Count: > 1 }) {
             for (int i = 0; i < route.Path.Count - 1; i++) {
                 var a = route.Path[i];
@@ -1095,24 +1628,70 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             }
         }
 
-        if (IsOnScreen(targetCenter)) {
-            float radius = ((targetRect.Right - targetRect.Left) / 2 * Settings.RingRadius) + 10;
-            Graphics.DrawCircle(targetCenter, radius, color, Settings.RingWidth, 32);
-            DrawCenteredTextWithBackground(targetLabel, targetCenter - new Vector2(0, radius + 12), Settings.FontColor, Settings.BackgroundColor, true, 10, 4);
+        // Rings + labels: one per stop for a multi-stop route (numbered in visiting order), otherwise the
+        // single target. Only nodes the game is currently rendering get a ring; the arrow handles the rest.
+        if (multi) {
+            foreach (var stop in route.Stops) {
+                if (stop?.Node == null || stop.Node.Visited)
+                    continue;
+                if (!descByCoord.TryGetValue(stop.Node.Coord, out var sd))
+                    continue;
+                RectangleF rect;
+                try { rect = sd.Element.GetClientRect(); }
+                catch { continue; }
+                Vector2 ctr = rect.Center;
+                if (!IsOnScreen(ctr))
+                    continue;
+                float rad = ((rect.Right - rect.Left) / 2 * Settings.RingRadius) + 10;
+                Graphics.DrawCircle(ctr, rad, color, Settings.RingWidth, 32);
+                string nm = stop.Node.Name ?? "(unknown)";
+                string desc = stop.MatchedContent != null ? $"{nm} - {stop.MatchedContent}" : nm;
+                string lbl = $"{prefix}{stop.Order}. {desc} ({stop.CumulativeSteps})";
+                DrawCenteredTextWithBackground(lbl, ctr - new Vector2(0, rad + 12), Settings.FontColor, Settings.BackgroundColor, true, 10, 4);
+            }
+        } else if (descByCoord.TryGetValue(target.Coord, out var targetDesc)) {
+            try {
+                var targetRect = targetDesc.Element.GetClientRect();
+                Vector2 targetCenter = targetRect.Center;
+                if (IsOnScreen(targetCenter)) {
+                    string tName = target.Name ?? "(unknown)";
+                    string tDesc = route.TargetContent != null ? $"{tName} - {route.TargetContent}" : tName;
+                    string tLabel = route.Steps >= 0 ? $"{prefix}{tDesc} ({route.Steps} steps)" : $"{prefix}{tDesc}";
+                    float radius = ((targetRect.Right - targetRect.Left) / 2 * Settings.RingRadius) + 10;
+                    Graphics.DrawCircle(targetCenter, radius, color, Settings.RingWidth, 32);
+                    DrawCenteredTextWithBackground(tLabel, targetCenter - new Vector2(0, radius + 12), Settings.FontColor, Settings.BackgroundColor, true, 10, 4);
+                }
+            } catch { }
         }
 
+        // Arrow toward the next thing to reach (the first stop for a multi-stop route). Works for off-screen
+        // targets too: a live rect if rendered, else an estimate from the fitted transform, else the nearest
+        // on-screen node on the route.
         if (Settings.ShowArrow) {
-            float distance = Vector2.Distance(screenCenter, targetCenter);
-            if (distance >= 400) {
+            if (!TryResolveScreenPos(target, route.Path, descByCoord, transform, out Vector2 tpos, out bool isLive))
+                return;
+            if (!isLive && !Settings.ShowFarArrows)
+                return;
+
+            // On-screen targets only get an arrow once they are far enough from center to be worth one; an
+            // estimated (off-screen) target always gets one, so it is never left with no indicator at all.
+            float distance = Vector2.Distance(screenCenter, tpos);
+            if (distance >= 400 || !isLive) {
+                string tName = target.Name ?? "(unknown)";
+                string tDesc = route.TargetContent != null ? $"{tName} - {route.TargetContent}" : tName;
+                string arrowLabel = multi
+                    ? $"{prefix}Next: {tDesc}  ({route.Steps} total)"
+                    : (route.Steps >= 0 ? $"{prefix}{tDesc} ({route.Steps} steps)" : $"{prefix}{tDesc}");
+
                 Vector2 arrowSize = new(64, 64);
                 var windowSize = GameController.Window.GetWindowRectangleTimeCache.Size;
-                Vector2 arrowPosition = targetCenter;
+                Vector2 arrowPosition = tpos;
                 arrowPosition.X = Math.Clamp(arrowPosition.X, 0, windowSize.X);
                 arrowPosition.Y = Math.Clamp(arrowPosition.Y, 0, windowSize.Y);
                 arrowPosition = Vector2.Lerp(screenCenter, arrowPosition, 0.80f);
                 arrowPosition -= new Vector2(arrowSize.X / 2, arrowSize.Y / 2);
 
-                Vector2 direction = targetCenter - screenCenter;
+                Vector2 direction = tpos - screenCenter;
                 float phi = (float)Math.Atan2(direction.Y, direction.X) + (float)(Math.PI / 2);
 
                 Color arrowColor = Color.FromArgb(255, color);
@@ -1120,9 +1699,140 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
                 Vector2 textPosition = arrowPosition + new Vector2(arrowSize.X / 2, arrowSize.Y / 2);
                 textPosition = Vector2.Lerp(textPosition, screenCenter, 0.10f);
-                DrawCenteredTextWithBackground(targetLabel, textPosition, arrowColor, Settings.BackgroundColor, true, 10, 4);
+                DrawCenteredTextWithBackground(arrowLabel, textPosition, arrowColor, Settings.BackgroundColor, true, 10, 4);
             }
         }
+    }
+
+    // A fitted affine map from atlas coordinates to screen pixels (screen = A*coord + b), recovered each
+    // frame from the nodes currently on screen. Lets the overlay estimate where an off-screen target sits so
+    // the arrow can point at maps you have not panned to. Valid only when the fit is trustworthy.
+    private struct AtlasTransform
+    {
+        public bool Valid;
+        public float Axx, Axy, Bx;
+        public float Ayx, Ayy, By;
+        public readonly Vector2 Apply(Vector2i c) => new(Axx * c.X + Axy * c.Y + Bx, Ayx * c.X + Ayy * c.Y + By);
+    }
+
+    // Where to draw/point for a node: its live on-screen center if the game currently renders it, else an
+    // estimate from the fitted transform, else the nearest on-screen node along the route. False if none.
+    private bool TryResolveScreenPos(GraphNode node, List<GraphNode> path, Dictionary<Vector2i, AtlasNodeDescription> descByCoord, AtlasTransform transform, out Vector2 pos, out bool isLive)
+    {
+        pos = default;
+        isLive = false;
+        if (node == null)
+            return false;
+
+        if (descByCoord.TryGetValue(node.Coord, out var d)) {
+            try { pos = d.Element.GetClientRect().Center; isLive = true; return true; }
+            catch { }
+        }
+
+        if (transform.Valid) {
+            pos = transform.Apply(node.Coord);
+            return true;
+        }
+
+        if (path != null) {
+            for (int i = path.Count - 1; i >= 0; i--) {
+                var pn = path[i];
+                if (pn == null || !descByCoord.TryGetValue(pn.Coord, out var pd))
+                    continue;
+                try {
+                    var c = pd.Element.GetClientRect().Center;
+                    if (IsOnScreen(c)) { pos = c; return true; }
+                } catch { }
+            }
+        }
+        return false;
+    }
+
+    // Least-squares fit of coord->screen from the on-screen nodes, using MEAN-CENTERED coordinates: this is
+    // far better conditioned than the raw normal equations and turns the singularity test into a meaningful
+    // relative one. Rejected when the visible nodes span too few distinct rows/columns (near-collinear, so an
+    // off-screen estimate would be unreliable) or when the in-sample residual is large vs the per-coord scale.
+    // Side of the square coordinate grid the fit samples from: FitGridDim^2 is the hard cap on how many
+    // GetClientRect reads the fit costs, no matter how many nodes are on screen.
+    private const int FitGridDim = 8;
+
+    private AtlasTransform FitAtlasTransform(Dictionary<Vector2i, AtlasNodeDescription> descByCoord)
+    {
+        var t = new AtlasTransform { Valid = false };
+        if (descByCoord.Count < 8)
+            return t;
+
+        // Bound the cost: an affine fit needs only a few dozen well-spread points, and each GetClientRect is
+        // a per-call game-memory read (parent-chain walk) - so reading one for every visible node every frame
+        // was the perf regression. Bucket nodes by atlas coordinate (a cheap integer read, no rect) into a
+        // coarse grid and read the screen rect of just one node per bucket. This caps the reads at
+        // FitGridDim^2 and keeps the samples spatially spread (the first N in hash order could be a
+        // near-collinear cluster that fails the conditioning test below).
+        int minX = int.MaxValue, minY = int.MaxValue, maxX = int.MinValue, maxY = int.MinValue;
+        foreach (var c in descByCoord.Keys) {
+            if (c.X < minX) minX = c.X;
+            if (c.X > maxX) maxX = c.X;
+            if (c.Y < minY) minY = c.Y;
+            if (c.Y > maxY) maxY = c.Y;
+        }
+        long spanX = Math.Max(1, maxX - minX), spanY = Math.Max(1, maxY - minY);
+
+        var picks = new Dictionary<int, (Vector2i coord, AtlasNodeDescription desc)>(FitGridDim * FitGridDim);
+        foreach (var kv in descByCoord) {
+            int gx = (int)((kv.Key.X - minX) * (FitGridDim - 1) / spanX);
+            int gy = (int)((kv.Key.Y - minY) * (FitGridDim - 1) / spanY);
+            picks.TryAdd(gy * FitGridDim + gx, (kv.Key, kv.Value));
+        }
+
+        var samples = new List<(double cx, double cy, double sx, double sy)>(picks.Count);
+        foreach (var p in picks.Values) {
+            Vector2 c;
+            try { c = p.desc.Element.GetClientRect().Center; }
+            catch { continue; }
+            if (c.X == 0 && c.Y == 0)
+                continue;
+            samples.Add((p.coord.X, p.coord.Y, c.X, c.Y));
+        }
+        if (samples.Count < 8)
+            return t;
+
+        int n = samples.Count;
+        double mcx = 0, mcy = 0, msx = 0, msy = 0;
+        foreach (var s in samples) { mcx += s.cx; mcy += s.cy; msx += s.sx; msy += s.sy; }
+        mcx /= n; mcy /= n; msx /= n; msy /= n;
+
+        double Sxx = 0, Sxy = 0, Syy = 0, rX0 = 0, rX1 = 0, rY0 = 0, rY1 = 0;
+        foreach (var s in samples) {
+            double dx = s.cx - mcx, dy = s.cy - mcy, ex = s.sx - msx, ey = s.sy - msy;
+            Sxx += dx * dx; Sxy += dx * dy; Syy += dy * dy;
+            rX0 += dx * ex; rX1 += dy * ex;
+            rY0 += dx * ey; rY1 += dy * ey;
+        }
+
+        double det2 = Sxx * Syy - Sxy * Sxy;
+        if (Sxx <= 0 || Syy <= 0 || det2 <= 1e-3 * Sxx * Syy)
+            return t;   // near-collinear visible nodes - extrapolating off-screen would be unreliable
+
+        double ax = (rX0 * Syy - rX1 * Sxy) / det2;
+        double bx = (Sxx * rX1 - Sxy * rX0) / det2;
+        double ay = (rY0 * Syy - rY1 * Sxy) / det2;
+        double by = (Sxx * rY1 - Sxy * rY0) / det2;
+        double cx0 = msx - ax * mcx - bx * mcy;
+        double cy0 = msy - ay * mcx - by * mcy;
+
+        t.Axx = (float)ax; t.Axy = (float)bx; t.Bx = (float)cx0;
+        t.Ayx = (float)ay; t.Ayy = (float)by; t.By = (float)cy0;
+
+        double sse = 0;
+        foreach (var s in samples) {
+            double exr = ax * s.cx + bx * s.cy + cx0 - s.sx;
+            double eyr = ay * s.cx + by * s.cy + cy0 - s.sy;
+            sse += exr * exr + eyr * eyr;
+        }
+        double rms = Math.Sqrt(sse / n);
+        double scale = Math.Max(Math.Sqrt(ax * ax + ay * ay), Math.Sqrt(bx * bx + by * by));   // px per coord step
+        t.Valid = scale > 1 && rms < 0.75 * scale;
+        return t;
     }
 
     #endregion
@@ -1241,6 +1951,18 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             ImGui.SameLine();
             if (ImGui.Button("Delete", new Vector2(64, 0)) && selectedPresetIndex >= 0)
                 DeletePreset(selectedPresetIndex);
+
+            ImGui.Separator();
+            ImGui.TextDisabled($"{cachedNodeCount} maps cached");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Maps remembered from everywhere you have panned over. The search covers all of them, not just what is on screen now - so pan around once and the finder keeps seeing those directions.");
+            if (ImGui.Button("Rescan", new Vector2(-1, 0))) {
+                finderClearCacheRequested = true;
+                mapFinderResults = new List<FinderResult>();   // drop stale results now; the rebuild republishes
+                mapFinderDirty = true;
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Forget the remembered maps and rebuild from what is on screen. Use after switching atlas / character if the results look stale.");
         } finally {
             ImGui.EndChild();
         }
@@ -1270,19 +1992,56 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 ImGui.SetTooltip("Route color on the atlas.");
 
             ImGui.Separator();
-            ImGui.TextDisabled("Mandatory  (the map this search locates)");
+            ImGui.TextDisabled("Mandatory  (one = closest; several = one route through all)");
 
-            ImGui.SetNextItemWidth(-1);
-            if (DrawMapNameCombo("##mand_map", p.MandatoryMap ?? "", out string newMap)) {
-                p.MandatoryMap = newMap;
-                changed = true;
+            // Migrate a legacy single-mandatory preset into the list the first time it is edited here.
+            p.Mandatories ??= new();
+            if (p.Mandatories.Count == 0 && (!string.IsNullOrWhiteSpace(p.MandatoryMap) || !string.IsNullOrWhiteSpace(p.MandatoryContent))) {
+                p.Mandatories.Add(new MandatoryEntry { Map = p.MandatoryMap ?? "", Content = p.MandatoryContent ?? "" });
+                p.MandatoryMap = "";
+                p.MandatoryContent = "";
             }
 
-            ImGui.SetNextItemWidth(-1);
-            if (DrawContentCombo("##mand_content", p.MandatoryContent ?? "", out string newContent)) {
-                p.MandatoryContent = newContent;
+            int removeMandAt = -1;
+            float mandSpacing = ImGui.GetStyle().ItemSpacing.X;
+            for (int mi = 0; mi < p.Mandatories.Count; mi++) {
+                var me = p.Mandatories[mi];
+                ImGui.PushID(2000 + mi);
+                try {
+                    // Reserve the actual remove-button width (a square ~one frame high) plus spacing, and use a
+                    // small floor so the two combos shrink instead of pushing the X button off a narrow pane.
+                    float xReserve = ImGui.GetFrameHeight() + mandSpacing * 2f;
+                    float comboW = Math.Max(70f, (ImGui.GetContentRegionAvail().X - xReserve) / 2f);
+                    ImGui.SetNextItemWidth(comboW);
+                    if (DrawMapNameCombo("##m_map", me.Map ?? "", out string newMMap)) {
+                        me.Map = newMMap;
+                        changed = true;
+                    }
+                    ImGui.SameLine();
+                    ImGui.SetNextItemWidth(comboW);
+                    if (DrawContentCombo("##m_content", me.Content ?? "", out string newMContent)) {
+                        me.Content = newMContent;
+                        changed = true;
+                    }
+                    ImGui.SameLine();
+                    if (ImGui.SmallButton("X"))
+                        removeMandAt = mi;
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Remove this mandatory stop.");
+                } finally {
+                    ImGui.PopID();
+                }
+            }
+            if (removeMandAt >= 0) {
+                p.Mandatories.RemoveAt(removeMandAt);
                 changed = true;
             }
+            if (ImGui.Button("Add mandatory")) {
+                p.Mandatories.Add(new MandatoryEntry());
+                changed = true;
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Add another required map. With two or more, the route is planned to visit them all.");
 
             ImGui.Spacing();
             ImGui.TextDisabled("Optionals  (a route near these is preferred)");
@@ -1474,8 +2233,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
     private void DrawPresetResults(SearchPreset p)
     {
-        bool hasFilter = !string.IsNullOrWhiteSpace(p.MandatoryMap) || !string.IsNullOrWhiteSpace(p.MandatoryContent);
-        if (!hasFilter) {
+        var mands = BuildMandatoryFilters(p);
+        if (mands.Count == 0) {
             ImGui.TextDisabled("Set a mandatory map or content/mod to search.");
             return;
         }
@@ -1486,8 +2245,23 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             ImGui.TextDisabled("Scanning the atlas...");
             return;
         }
+
+        // Warnings first (e.g. a mandatory map with no reachable instance that was skipped from the route).
+        if (route.Warnings != null)
+            foreach (var w in route.Warnings)
+                ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f), w);
+
+        bool multi = route.Stops != null && route.Stops.Count > 0;
+
+        if (multi) {
+            DrawItinerary(route);
+            DrawOptionalDiagnostics(route);
+            return;
+        }
+
         if (route.Matches.Count == 0) {
-            ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f), "No unvisited maps match this search.");
+            if (route.Warnings == null || route.Warnings.Count == 0)
+                ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f), "No unvisited maps match this search.");
             return;
         }
 
@@ -1520,29 +2294,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             }
         }
 
-        // Per-optional diagnostics for the chosen route, so it's obvious why optionals did or didn't help.
-        if (route.NearOptionals != null && route.NearOptionals.Count > 0) {
-            int radius = Settings.CorridorRadius.Value;
-            foreach (var near in route.NearOptionals) {
-                string label = string.IsNullOrWhiteSpace(near.Label) ? "(optional)" : near.Label;
-                Vector4 col;
-                string text;
-                if (near.Matches == 0) {
-                    col = new Vector4(1f, 0.5f, 0.4f, 1f);
-                    text = $"{label}: no maps match this name / mod";
-                } else if (near.Gap < 0) {
-                    col = new Vector4(0.85f, 0.8f, 0.5f, 1f);
-                    text = $"{label}: {near.Matches} map(s), but none connect to this route";
-                } else if (near.InRange) {
-                    col = new Vector4(0.5f, 0.95f, 0.6f, 1f);
-                    text = $"{label}: {near.Matches} map(s), nearest {near.Gap} hop(s) off route - bonus applied";
-                } else {
-                    col = new Vector4(0.7f, 0.7f, 0.75f, 1f);
-                    text = $"{label}: {near.Matches} map(s), nearest {near.Gap} hop(s) (beyond radius {radius})";
-                }
-                ImGui.TextColored(col, text);
-            }
-        }
+        DrawOptionalDiagnostics(route);
 
         ImGui.Separator();
 
@@ -1612,12 +2364,81 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         }
     }
 
+    // The planned multi-stop route: a summary line, then each stop in visiting order with cumulative steps.
+    private void DrawItinerary(FinderResult route)
+    {
+        int stopCount = route.Stops.Count;
+        string bonusNote = route.Bonus > 0.05f ? $"   optionals -{route.Bonus:0.0}" : "";
+        ImGui.TextColored(new Vector4(0.4f, 0.9f, 1f, 1f),
+            $"Route: {stopCount} stop{(stopCount == 1 ? "" : "s")}, {route.Steps} step{(route.Steps == 1 ? "" : "s")} total{bonusNote}");
+
+        ImGui.Separator();
+        var flags = ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY;
+        if (ImGui.BeginTable("mapfinder_itinerary", 3, flags, new Vector2(0, 0))) {
+            try {
+                ImGui.TableSetupColumn("#", ImGuiTableColumnFlags.WidthFixed, 24);
+                ImGui.TableSetupColumn("Stop", ImGuiTableColumnFlags.WidthStretch, 200);
+                ImGui.TableSetupColumn("Steps", ImGuiTableColumnFlags.WidthFixed, 50);
+                ImGui.TableHeadersRow();
+
+                foreach (var stop in route.Stops) {
+                    ImGui.TableNextRow();
+
+                    ImGui.TableNextColumn();
+                    ImGui.TextDisabled(stop.Order.ToString());
+
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(stop.Node?.Name ?? "(unknown)");
+                    if (stop.MatchedContent != null) {
+                        ImGui.SameLine();
+                        ImGui.TextDisabled("(" + stop.MatchedContent + ")");
+                    }
+
+                    ImGui.TableNextColumn();
+                    Color stepsColor = stop.CumulativeSteps <= 3 ? Color.LightGreen : (stop.CumulativeSteps <= 7 ? Color.Yellow : Color.OrangeRed);
+                    ImGui.TextColored(ToVector4(stepsColor), stop.CumulativeSteps.ToString());
+                }
+            } finally {
+                ImGui.EndTable();
+            }
+        }
+    }
+
+    // Per-optional diagnostics for the chosen route, so it's obvious why optionals did or didn't help.
+    private void DrawOptionalDiagnostics(FinderResult route)
+    {
+        if (route.NearOptionals == null || route.NearOptionals.Count == 0)
+            return;
+
+        int radius = Settings.CorridorRadius.Value;
+        foreach (var near in route.NearOptionals) {
+            string label = string.IsNullOrWhiteSpace(near.Label) ? "(optional)" : near.Label;
+            Vector4 col;
+            string text;
+            if (near.Matches == 0) {
+                col = new Vector4(1f, 0.5f, 0.4f, 1f);
+                text = $"{label}: no maps match this name / mod";
+            } else if (near.Gap < 0) {
+                col = new Vector4(0.85f, 0.8f, 0.5f, 1f);
+                text = $"{label}: {near.Matches} map(s), but none connect to this route";
+            } else if (near.InRange) {
+                col = new Vector4(0.5f, 0.95f, 0.6f, 1f);
+                text = $"{label}: {near.Matches} map(s), nearest {near.Gap} hop(s) off route - bonus applied";
+            } else {
+                col = new Vector4(0.7f, 0.7f, 0.75f, 1f);
+                text = $"{label}: {near.Matches} map(s), nearest {near.Gap} hop(s) (beyond radius {radius})";
+            }
+            ImGui.TextColored(col, text);
+        }
+    }
+
     private void AddPreset()
     {
         var presets = Settings.Presets;
         presets.Add(new SearchPreset {
             Name = $"Search {presets.Count + 1}",
             ColorArgb = PresetPalette[presets.Count % PresetPalette.Length].ToArgb(),
+            Mandatories = new() { new MandatoryEntry() },   // start with one empty mandatory row
         });
         selectedPresetIndex = presets.Count - 1;
         mapFinderDirty = true;
