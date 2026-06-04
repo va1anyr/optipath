@@ -4,6 +4,8 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 using ExileCore2;
@@ -43,6 +45,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
     private bool MapFinderPanelIsOpen = false;
     private bool mapFinderFocusInput = false;
+    private string mapFinderContentFilter = "";
     private bool mapFinderDirty = false;
     private string mapFinderPinnedKey = null;
     private DateTime lastFinderRecompute = DateTime.Now;
@@ -53,6 +56,23 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     // Latest computed route, swapped in atomically by the worker and read by Render.
     private volatile FinderResult mapFinder = new();
 
+    // Distinct content/mod tags seen on the current atlas, published by the worker for the dropdown.
+    private volatile List<string> availableContentTags = new();
+
+    // Well-known content/mod types, always offered in the dropdown even before the atlas reveals one.
+    // Anything else the atlas exposes (e.g. "Azmeri Energisation") is merged in at runtime.
+    private static readonly string[] KnownContentTypes = {
+        "Abyss", "Anomaly Map Boss", "Breach", "Cleansed", "Corrupted", "Corrupted Nexus",
+        "Deadly Map Boss", "Delirium", "Expedition", "Irradiated", "Map Boss", "Powerful Map Boss",
+        "Ritual", "Tower", "Unique Map",
+    };
+
+    // A few content identities the game names differently from what players call them. Mapped so the
+    // dropdown's familiar label (e.g. "Cleansed") matches the node's actual content id (e.g. "Sanctified").
+    private static readonly Dictionary<string, string> ContentIdAliases = new(StringComparer.OrdinalIgnoreCase) {
+        ["Sanctified"] = "Cleansed",
+    };
+
     // Immutable copy of an atlas node, so the background search never touches live game objects.
     private sealed class GraphNode
     {
@@ -61,12 +81,16 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         public bool Visited;
         public bool Unlocked;
         public bool Active;
+        // Content / map mods on the node (e.g. "Powerful Map Boss", "Corrupted Nexus", "Tower").
+        public List<string> ContentTags;
     }
 
     private sealed class FinderMatch
     {
         public GraphNode Node { get; init; }
         public int Steps { get; init; }
+        // The content tag that matched the query, or null when the map name matched.
+        public string MatchedContent { get; init; }
     }
 
     private sealed class FinderResult
@@ -75,6 +99,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         public GraphNode Target { get; init; }
         public List<GraphNode> Path { get; init; }
         public int Steps { get; init; } = -1;
+        public string TargetContent { get; init; }
     }
 
     public override bool Initialise()
@@ -102,9 +127,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
         screenCenter = GameController.Window.GetWindowRectangle().Center - GameController.Window.GetWindowRectangle().Location;
 
-        // Refresh the route every couple of seconds while a search is active so step counts track progress.
-        bool hasQuery = !string.IsNullOrWhiteSpace(Settings.SearchQuery);
-        if (hasQuery && !finderBusy && DateTime.Now.Subtract(lastFinderRecompute).TotalSeconds > 2)
+        // Refresh every couple of seconds while a filter is active (so step counts track progress) or
+        // while the panel is open (so the content dropdown stays populated as the atlas reveals more).
+        bool active = HasActiveFilter() || MapFinderPanelIsOpen;
+        if (active && !finderBusy && DateTime.Now.Subtract(lastFinderRecompute).TotalSeconds > 2)
             mapFinderDirty = true;
 
         if (mapFinderDirty && !finderBusy) {
@@ -150,22 +176,22 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
     #region Map Finder
 
-    // Run the scan + search off the render thread; atlas reads here are read-only.
+    private bool HasActiveFilter()
+        => !string.IsNullOrWhiteSpace(Settings.SearchQuery) || !string.IsNullOrWhiteSpace(Settings.SelectedContent);
+
+    // Run the scan + search off the render thread; atlas reads here are read-only. The scan always runs
+    // (even with no filter) so the content dropdown can be populated from the live atlas.
     private void DispatchRecompute()
     {
-        string query = Settings.SearchQuery?.Trim() ?? "";
-        if (query.Length == 0) {
-            mapFinder = new FinderResult();
-            lastFinderRecompute = DateTime.Now;
-            return;
-        }
+        string nameQuery = Settings.SearchQuery?.Trim() ?? "";
+        string contentFilter = Settings.SelectedContent?.Trim() ?? "";
 
         var atlas = AtlasPanel;
         string pinned = mapFinderPinnedKey;
         finderBusy = true;
         Task.Run(() => {
             try {
-                RecomputeMapFinder(atlas, query, pinned);
+                RecomputeMapFinder(atlas, nameQuery, contentFilter, pinned);
             } catch (Exception e) {
                 LogError("Error computing map finder route: " + e.Message + "\n" + e.StackTrace);
             } finally {
@@ -176,9 +202,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     }
 
     // Scans the atlas into a private graph, runs a multi-source BFS out from your completed/unlocked maps,
-    // and picks the nearest unvisited match for the query. Matching is independent of reachability, so a
-    // map that exists is always listed (with a step count, or "?" when there's no route to it).
-    private void RecomputeMapFinder(AtlasPanel atlas, string query, string pinnedKey)
+    // and picks the nearest unvisited match for the filters (map name and/or content/mod). Matching is
+    // independent of reachability, so a map that exists is always listed (steps, or "?" when unreachable).
+    // Also publishes the distinct content tags seen this pass for the dropdown.
+    private void RecomputeMapFinder(AtlasPanel atlas, string nameQuery, string contentFilter, string pinnedKey)
     {
         if (atlas == null) {
             mapFinder = new FinderResult();
@@ -257,11 +284,20 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 Name = name,
                 Visited = visited,
                 Unlocked = unlocked,
-                Active = active
+                Active = active,
+                ContentTags = CollectContentTags(el)
             };
             nodes.Add(gn);
             nodeByCoord[coord] = gn;
         }
+
+        // Publish the distinct content/mod tags on this atlas so the dropdown can offer them.
+        var distinctTags = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var n in nodes)
+            if (n.ContentTags != null)
+                foreach (var t in n.ContentTags)
+                    distinctTags.Add(t);
+        availableContentTags = distinctTags.ToList();
 
         if (nodes.Count == 0) {
             mapFinder = new FinderResult();
@@ -300,9 +336,17 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         }
 
         // Reachable matches first (closest by steps), then the rest, ties broken by name.
-        var matches = nodes
-            .Where(n => !n.Visited && MatchesQuery(n, query))
-            .Select(n => new FinderMatch { Node = n, Steps = dist.TryGetValue(n.Coord, out int s) ? s : -1 })
+        var matches = new List<FinderMatch>();
+        foreach (var n in nodes) {
+            if (n.Visited || !MatchesFilters(n, nameQuery, contentFilter, out string matchedContent))
+                continue;
+            matches.Add(new FinderMatch {
+                Node = n,
+                Steps = dist.TryGetValue(n.Coord, out int s) ? s : -1,
+                MatchedContent = matchedContent
+            });
+        }
+        matches = matches
             .OrderBy(m => m.Steps < 0 ? int.MaxValue : m.Steps)
             .ThenBy(m => m.Node.Name ?? "", StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -322,12 +366,164 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             Matches = matches,
             Target = chosen.Node,
             Path = chosen.Steps >= 0 ? ReconstructFinderPath(chosen.Node.Coord, prev, nodeByCoord) : null,
-            Steps = chosen.Steps
+            Steps = chosen.Steps,
+            TargetContent = chosen.MatchedContent
         };
     }
 
-    private static bool MatchesQuery(GraphNode node, string query)
-        => node.Name != null && node.Name.Contains(query, StringComparison.OrdinalIgnoreCase);
+    // A node matches when every active filter passes: the map name (substring) and/or the chosen
+    // content/mod (exact match, ignoring case and spacing so "corruptednexus" == "Corrupted Nexus" but
+    // never "Corrupted"). With no filter active nothing matches.
+    private static bool MatchesFilters(GraphNode node, string nameQuery, string contentFilter, out string matchedContent)
+    {
+        matchedContent = null;
+
+        bool hasName = !string.IsNullOrEmpty(nameQuery);
+        bool hasContent = !string.IsNullOrEmpty(contentFilter);
+        if (!hasName && !hasContent)
+            return false;
+
+        if (hasName && (node.Name == null || !node.Name.Contains(nameQuery, StringComparison.OrdinalIgnoreCase)))
+            return false;
+
+        if (hasContent) {
+            string want = NormalizeForMatch(contentFilter);
+            string hit = node.ContentTags?.FirstOrDefault(t => NormalizeForMatch(t) == want);
+            if (hit == null)
+                return false;
+            matchedContent = hit;
+        }
+
+        return true;
+    }
+
+    // Dropdown options: a leading "" (Any), then the well-known content types merged with whatever the
+    // current atlas exposes, de-duplicated by normalized form and sorted for a stable list.
+    private List<string> BuildContentOptions()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var union = new List<string>();
+
+        void Add(string value) {
+            if (string.IsNullOrWhiteSpace(value))
+                return;
+            string key = NormalizeForMatch(value);
+            if (key.Length == 0 || !seen.Add(key))
+                return;
+            union.Add(value);
+        }
+
+        foreach (var known in KnownContentTypes)
+            Add(known);
+        foreach (var tag in availableContentTags)
+            Add(tag);
+
+        union.Sort(StringComparer.OrdinalIgnoreCase);
+
+        var options = new List<string> { "" };   // "" represents "Any content / mod"
+        options.AddRange(union);
+        return options;
+    }
+
+    // Reads the content / map mods shown on a node: structured content identities (the icons the game
+    // draws, e.g. "PowerfulMapBoss"), a few content types only told apart by their overlay texture, and
+    // the tower marker. Every read is guarded so a node simply contributes fewer tags on failure.
+    private static List<string> CollectContentTags(AtlasPanelNode el)
+    {
+        var tags = new List<string>();
+
+        void Add(string tag) {
+            if (!string.IsNullOrWhiteSpace(tag) && !tags.Contains(tag, StringComparer.OrdinalIgnoreCase))
+                tags.Add(tag);
+        }
+
+        try {
+            var identities = el.ContentIdentity;
+            if (identities != null) {
+                foreach (var identity in identities) {
+                    string id = null;
+                    try { id = identity?.Id; } catch { }
+                    Add(ResolveContentId(id));
+                }
+            }
+        } catch { }
+
+        // Granular per-map content variant - the specific modifier name the game assigns (e.g. "Zealous
+        // Reverence", "Spirit Migration"), so the finder can search an exact mod, not just the broad type.
+        try {
+            string variant = el.AtlasEntry?.MapContent?.Name;
+            if (IsPlayerFacingContent(variant))
+                Add(variant.Trim());
+        } catch { }
+
+        try {
+            var overlay = el.GetChildAtIndex(0)?.GetChildAtIndex(0)?.Children;
+            if (overlay != null) {
+                bool HasTexture(string fragment) =>
+                    overlay.Any(c => c?.TextureName?.Contains(fragment, StringComparison.OrdinalIgnoreCase) == true);
+
+                if (HasTexture("CorruptionNexus")) Add("Corrupted Nexus");
+                else if (HasTexture("Corrupt")) Add("Corrupted");
+                if (HasTexture("Sanctification")) Add("Cleansed");
+                if (HasTexture("UniqueMap")) Add("Unique Map");
+                if (HasTexture("MapBossSpecial")) Add("Anomaly Map Boss");
+                if (HasTexture("ContentMapBoss.dds")) Add("Map Boss");
+            }
+        } catch { }
+
+        try {
+            if (el.Height == 110)   // tower nodes are taller than map nodes
+                Add("Tower");
+        } catch { }
+
+        return tags;
+    }
+
+    // Humanizes a content identity id, first applying any alias so an internal name maps to the label
+    // players (and the dropdown) actually use - e.g. the "Sanctified" id becomes "Cleansed".
+    private static string ResolveContentId(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            return null;
+        return ContentIdAliases.TryGetValue(id.Trim(), out var alias) ? alias : HumanizeContentId(id);
+    }
+
+    // True when a map-content name is a real, player-visible variant rather than an internal placeholder
+    // (the game tags some content "[DNT] ... Not Shown to Players").
+    private static bool IsPlayerFacingContent(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+        if (name.StartsWith("[DNT]", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (name.Contains("Not Shown", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return true;
+    }
+
+    // "PowerfulMapBoss" / "AZMERI_Energisation" -> "Powerful Map Boss" / "Azmeri Energisation".
+    private static string HumanizeContentId(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            return null;
+        string value = id.Replace("_", " ").Replace("-", " ").Trim();
+        value = Regex.Replace(value, @"([A-Z]+)([A-Z][a-z])", "$1 $2");
+        value = Regex.Replace(value, @"([a-z0-9])([A-Z])", "$1 $2");
+        value = Regex.Replace(value, @"\s+", " ").Trim();
+        return value.Length == 0 ? null : value;
+    }
+
+    // Strips case, spaces and punctuation so queries match content tags regardless of formatting.
+    private static string NormalizeForMatch(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "";
+        var sb = new StringBuilder(value.Length);
+        foreach (char c in value)
+            if (char.IsLetterOrDigit(c))
+                sb.Append(char.ToLowerInvariant(c));
+        return sb.ToString();
+    }
 
     private static List<GraphNode> ReconstructFinderPath(Vector2i targetCoord, Dictionary<Vector2i, Vector2i> prev, Dictionary<Vector2i, GraphNode> nodeByCoord)
     {
@@ -380,7 +576,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
         Vector2 targetCenter = targetRect.Center;
         string targetName = target.Name ?? "(unknown)";
-        string targetLabel = route.Steps >= 0 ? $"{targetName} ({route.Steps} steps)" : targetName;
+        string targetDescription = route.TargetContent != null ? $"{targetName} - {route.TargetContent}" : targetName;
+        string targetLabel = route.Steps >= 0 ? $"{targetDescription} ({route.Steps} steps)" : targetDescription;
 
         if (Settings.ShowPath && route.Path is { Count: > 1 }) {
             for (int i = 0; i < route.Path.Count - 1; i++) {
@@ -447,7 +644,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
         // try/finally keeps the ImGui stack balanced if anything below throws.
         try {
-            ImGui.TextWrapped("Find the closest unvisited map of a given type, measured in steps from your completed nodes.");
+            ImGui.TextWrapped("Find the closest unvisited map by name and/or content, measured in steps from your completed nodes. Type a map name in the box, pick a content/mod from the dropdown, or combine both.");
             ImGui.Separator();
 
             if (mapFinderFocusInput) {
@@ -470,6 +667,65 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 changed = true;
             }
 
+            // Content / mod dropdown: "Any", the well-known types, plus whatever this atlas exposes.
+            // The popup opens with a type-to-filter box so the list can be narrowed like a fuzzy finder.
+            var contentOptions = BuildContentOptions();
+            int currentIndex = Math.Max(0, contentOptions.FindIndex(
+                o => string.Equals(o, Settings.SelectedContent ?? "", StringComparison.OrdinalIgnoreCase)));
+            string Label(int i) => contentOptions[i].Length == 0 ? "Any content / mod" : contentOptions[i];
+
+            ImGui.SetNextItemWidth(-100);
+            if (ImGui.BeginCombo("##mapfinder_content", Label(currentIndex))) {
+                try {
+                    // Reset the filter and put the cursor in the box each time the popup opens.
+                    if (ImGui.IsWindowAppearing()) {
+                        mapFinderContentFilter = "";
+                        ImGui.SetKeyboardFocusHere();
+                    }
+
+                    ImGui.SetNextItemWidth(-float.Epsilon);
+                    bool enter = ImGui.InputTextWithHint("##mapfinder_content_filter", "Type to filter...",
+                        ref mapFinderContentFilter, 64, ImGuiInputTextFlags.EnterReturnsTrue);
+                    ImGui.Separator();
+
+                    string filter = NormalizeForMatch(mapFinderContentFilter);
+                    var visible = new List<int>();
+                    for (int i = 0; i < contentOptions.Count; i++)
+                        if (filter.Length == 0 || NormalizeForMatch(Label(i)).Contains(filter))
+                            visible.Add(i);
+
+                    // Enter selects the first remaining match, mirroring a fuzzy finder.
+                    if (enter && visible.Count > 0) {
+                        Settings.SelectedContent = contentOptions[visible[0]];
+                        changed = true;
+                        ImGui.CloseCurrentPopup();
+                    }
+
+                    if (visible.Count == 0) {
+                        ImGui.TextDisabled("No matching content / mod.");
+                    } else {
+                        foreach (int i in visible) {
+                            bool selected = i == currentIndex;
+                            if (ImGui.Selectable(Label(i), selected)) {
+                                Settings.SelectedContent = contentOptions[i];
+                                changed = true;
+                            }
+                            if (selected)
+                                ImGui.SetItemDefaultFocus();
+                        }
+                    }
+                }
+                finally {
+                    ImGui.EndCombo();
+                }
+            }
+
+            ImGui.SameLine();
+            if (ImGui.Button("Reset", new Vector2(90, 0))) {
+                Settings.SelectedContent = "";
+                changed = true;
+            }
+
             if (changed) {
                 mapFinderPinnedKey = null;
                 mapFinderDirty = true;
@@ -477,8 +733,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
             ImGui.Spacing();
 
-            if (string.IsNullOrWhiteSpace(Settings.SearchQuery)) {
-                ImGui.TextDisabled("Type a map name to search.");
+            if (!HasActiveFilter()) {
+                ImGui.TextDisabled("Type a map name or pick a content/mod to search.");
                 return;
             }
 
@@ -491,12 +747,13 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
             if (route.Target != null && !route.Target.Visited) {
                 string targetName = route.Target.Name ?? "(unknown)";
+                string targetLabel = route.TargetContent != null ? $"{targetName} ({route.TargetContent})" : targetName;
                 if (route.Steps >= 0)
                     ImGui.TextColored(new Vector4(0.4f, 0.9f, 1f, 1f),
-                        $"Closest: {targetName}  -  {route.Steps} step{(route.Steps == 1 ? "" : "s")}");
+                        $"Closest: {targetLabel}  -  {route.Steps} step{(route.Steps == 1 ? "" : "s")}");
                 else
                     ImGui.TextColored(new Vector4(1f, 0.78f, 0.4f, 1f),
-                        $"Found: {targetName}  -  no path from your completed/unlocked maps");
+                        $"Found: {targetLabel}  -  no path from your completed/unlocked maps");
 
                 if (mapFinderPinnedKey != null) {
                     ImGui.SameLine();
@@ -541,6 +798,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                                 ImGui.TextColored(new Vector4(0.4f, 0.9f, 1f, 1f), name);
                             else
                                 ImGui.TextUnformatted(name);
+                            if (match.MatchedContent != null) {
+                                ImGui.SameLine();
+                                ImGui.TextDisabled("(" + match.MatchedContent + ")");
+                            }
 
                             ImGui.TableNextColumn();
                             if (match.Steps < 0) {

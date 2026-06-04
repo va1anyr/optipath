@@ -10,7 +10,7 @@ public class OptiPatherSettings : ISettings
 {
     public ToggleNode Enable { get; set; } = new ToggleNode(false);
 
-    [Menu("Map Finder Panel Hotkey", "Opens the window to locate the closest unvisited map of a given type (by number of steps from your completed nodes). Default: PageDown")]
+    [Menu("Map Finder Panel Hotkey", "Opens the window to locate the closest unvisited map by name or by content/mods - e.g. Powerful Map Boss, Corrupted Nexus - measured in steps from your completed nodes. Default: PageDown")]
     public HotkeyNode MapFinderPanelHotkey { get; set; } = new HotkeyNode(Keys.PageDown);
 
     [Menu("Show Route on Atlas", "Draw a highlight, path and arrow pointing to the closest matching map.")]
@@ -55,4 +55,7 @@ public class OptiPatherSettings : ISettings
 
     // Remembered between sessions; edited through the panel's search box.
     public string SearchQuery { get; set; } = "";
+
+    // Remembered between sessions; selected through the panel's content/mod dropdown ("" = Any).
+    public string SelectedContent { get; set; } = "";
 }
