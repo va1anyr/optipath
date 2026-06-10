@@ -14,6 +14,9 @@ public class OptiPatherSettings : ISettings
     [Menu("Map Finder Panel Hotkey", "Opens the window to build searches and locate the closest unvisited map by name or content/mods - e.g. Powerful Map Boss, Corrupted Nexus - measured in steps from your completed nodes. Default: PageDown")]
     public HotkeyNode MapFinderPanelHotkey { get; set; } = new HotkeyNode(Keys.PageDown);
 
+    [Menu("Remember Atlas Across Sessions", "Save the maps you have panned over to disk, per character, so the finder still sees them after a game restart or plugin reload - no need to re-pan. Maps you completed while the atlas was closed may show faint and 'unconfirmed' until you pan over them again. Turn off to keep everything in memory only.")]
+    public ToggleNode PersistAtlas { get; set; } = new ToggleNode(true);
+
     [Menu("Show Route on Atlas", "Draw a highlight, path and arrow pointing to the closest matching map for each active search.")]
     public ToggleNode ShowOnAtlas { get; set; } = new ToggleNode(true);
 

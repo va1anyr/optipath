@@ -30,9 +30,23 @@ namespace OptiPather;
 // loop only resolves live node positions for drawing.
 public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 {
-    public const string Version = "2.1.2";
+    public const string Version = "2.2.0";
 
     private const string ArrowTextureKey = "optipather_arrow.png";
+
+    // On-disk graph format version. Bump on any schema change to NodeDto/EdgeDto/GraphSnapshot;
+    // a file written by a different version is discarded and rebuilt by re-panning the atlas.
+    private const int GraphSchemaVersion = 1;
+    // Seconds of unsaved changes to tolerate before the worker writes the graph to disk.
+    private const double SaveDebounceSeconds = 15;
+    // Refuse to load a file claiming more nodes than this - a real atlas is far smaller, so a larger
+    // count means a corrupt/garbage file.
+    private const int MaxPersistNodes = 200000;
+    // The swap detector must see its signal this many scans in a row before wiping the cache, so a
+    // single partial atlas read (e.g. just after an instance reload) can't nuke remembered maps.
+    private const int SwapConfirmScans = 3;
+    // How many ticks a (league, character) reading must repeat before it is trusted as the live key.
+    private const int IdentityStableTicks = 3;
 
     private IngameUIElements UI;
     private AtlasPanel AtlasPanel;
@@ -50,7 +64,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     private bool MapFinderPanelIsOpen = false;
     private string mapFinderContentFilter = "";
     private string mapFinderNameFilter = "";
-    private bool mapFinderDirty = false;
+    private volatile bool mapFinderDirty = false;
     private int selectedPresetIndex = 0;
     // Width of the query list pane; dragged by the splitter between it and the editor.
     private float presetListWidth = 180f;
@@ -80,6 +94,31 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     private volatile bool finderClearCacheRequested = false;
     // Published cache size, shown in the panel as a coverage readout.
     private volatile int cachedNodeCount = 0;
+
+    // --- Atlas persistence (remember the graph on disk, per character, across restarts/reloads) ---
+    // The (league, character) key the in-memory cache currently belongs to. Only the worker writes it.
+    private volatile string loadedIdentityKey = null;
+    // Set on the main thread; the worker saves the graph regardless of the debounce when this is set,
+    // and clears it only after a successful write (so a dropped flag can't silently skip the flush).
+    private volatile bool persistFlushRequested = false;
+    // Set with finderClearCacheRequested by Rescan: also forget the on-disk file, not just memory.
+    private volatile bool persistForgetRequested = false;
+    // Set by the worker when the save directory is unwritable, so it stops retrying every scan.
+    private volatile bool persistDisabled = false;
+    // SavedUtc of the file the current cache was loaded from, surfaced as a "remembered ago" readout.
+    private volatile string cacheRememberedAge = null;
+    // Worker-local persistence bookkeeping (touched only inside the scan worker).
+    private DateTime lastPersistSave = DateTime.MinValue;
+    private bool persistDirty = false;
+    private bool persistDirReady = false;
+    // Consecutive scans the atlas-swap signal has held; the cache is only wiped once it confirms.
+    private int swapSignalStreak = 0;
+    // Main-thread identity debounce: a (league, character) read must repeat before it is trusted.
+    private string identityCandidate = null;
+    private int identityStableCount = 0;
+    private string stableIdentityKey = null;
+    // Tracks the atlas open/closed edge so the worker can flush once when the atlas is closed.
+    private bool atlasWasVisible = false;
 
     // Distinct content/mod tags seen on the current atlas, published by the worker for the dropdown.
     private volatile List<string> availableContentTags = new();
@@ -123,6 +162,45 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         public bool Active;
         // Content / map mods on the node (e.g. "Powerful Map Boss", "Corrupted Nexus", "Tower").
         public List<string> ContentTags;
+        // True when this snapshot came from a live atlas scan this session; false for a node rebuilt
+        // from the saved file and not yet re-seen. Not persisted - it resets to false on every load.
+        public bool SeenLive;
+    }
+
+    // On-disk shape of the accumulated atlas graph, one file per character. Plain ints are used instead
+    // of Vector2i so coordinates never become JSON dictionary keys (which must be strings).
+    private sealed class GraphSnapshot
+    {
+        public int SchemaVersion { get; set; }
+        // The (league, character) key this file belongs to; asserted on load so a hand-copied or
+        // mis-resolved file is rejected rather than loaded for the wrong character.
+        public string IdentityKey { get; set; }
+        public DateTime SavedUtc { get; set; }
+        public int NodeCount { get; set; }
+        public List<NodeDto> Nodes { get; set; } = new();
+        public List<EdgeDto> Edges { get; set; } = new();
+    }
+
+    // A persisted node. Active is deliberately not stored: it is transient game state, and a stale
+    // Active node would seed a bogus zero-step origin for the route.
+    private sealed class NodeDto
+    {
+        public int X { get; set; }
+        public int Y { get; set; }
+        public string Name { get; set; }
+        public bool V { get; set; }   // Visited
+        public bool U { get; set; }   // Unlocked
+        public List<string> T { get; set; }   // ContentTags
+    }
+
+    // One undirected edge, stored a single direction (the lexicographically smaller endpoint first);
+    // both directions are re-added on load.
+    private sealed class EdgeDto
+    {
+        public int AX { get; set; }
+        public int AY { get; set; }
+        public int BX { get; set; }
+        public int BY { get; set; }
     }
 
     private sealed class FinderMatch
@@ -275,10 +353,29 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         UI = GameController?.Game?.IngameState?.IngameUi;
         AtlasPanel = UI?.WorldMap?.AtlasPanel;
 
-        if (AtlasPanel is not { IsVisible: true }) {
+        // Resolve the character/league identity on the main thread; the worker never reads game state.
+        UpdateIdentity();
+
+        bool visible = AtlasPanel is { IsVisible: true };
+
+        // The atlas was just closed: flush the remembered graph once. No more scans dispatch while it is
+        // hidden, so this is the last chance to save what was panned over before the player runs a map.
+        if (atlasWasVisible && !visible) {
+            atlasWasVisible = false;
+            if (Settings.PersistAtlas && !persistDisabled && loadedIdentityKey != null) {
+                persistFlushRequested = true;
+                if (!finderBusy) {
+                    mapFinderDirty = false;
+                    DispatchRecompute();
+                }
+            }
+        }
+
+        if (!visible) {
             MapFinderPanelIsOpen = false;
             return;
         }
+        atlasWasVisible = true;
 
         screenCenter = GameController.Window.GetWindowRectangle().Center - GameController.Window.GetWindowRectangle().Location;
 
@@ -291,6 +388,52 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         if (mapFinderDirty && !finderBusy) {
             mapFinderDirty = false;
             DispatchRecompute();
+        }
+    }
+
+    // A zone change is a natural checkpoint to persist the graph; signal only (the worker honors it on
+    // its next pass), never start file work here.
+    public override void AreaChange(AreaInstance area)
+    {
+        if (Settings.PersistAtlas && !persistDisabled && loadedIdentityKey != null)
+            persistFlushRequested = true;
+    }
+
+    // Reads the current (league, character) identity and debounces it, so a transient mixed read during
+    // a character switch (e.g. new league but the previous name still in memory) does not switch files.
+    // Runs on the main thread; the worker only ever sees the debounced stableIdentityKey via DispatchRecompute.
+    private void UpdateIdentity()
+    {
+        string id = ResolveIdentity();
+        if (id != null && id == identityCandidate) {
+            if (identityStableCount < IdentityStableTicks)
+                identityStableCount++;
+        } else {
+            identityCandidate = id;
+            identityStableCount = id == null ? 0 : 1;
+        }
+        // Only promote a non-null identity once it has held steady; a transient null (loading/hideout)
+        // keeps the last stable key so the worker simply doesn't switch this pass.
+        if (id != null && identityStableCount >= IdentityStableTicks)
+            stableIdentityKey = id;
+    }
+
+    // The save key for the active character, or null when not safely in game. League is used raw (only
+    // sanitized for the filename) so SSF / HC / trade progressions, which share the coordinate space but
+    // not completion, never collide on one file.
+    private string ResolveIdentity()
+    {
+        try {
+            var gc = GameController;
+            if (gc == null || !gc.InGame || gc.IsLoading)
+                return null;
+            string league = gc.IngameState?.ServerData?.League;
+            string name = gc.Player?.GetComponent<ExileCore2.PoEMemory.Components.Render>()?.Name;
+            if (string.IsNullOrWhiteSpace(league) || string.IsNullOrWhiteSpace(name))
+                return null;
+            return Sanitize(league) + "__" + Sanitize(name);
+        } catch {
+            return null;
         }
     }
 
@@ -422,11 +565,13 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         int maxExtra = Math.Max(0, Settings.MaxExtraHops.Value);
         float hysteresis = Math.Max(0f, Settings.OptionalHysteresis.Value);
         var previous = mapFinderResults;
+        // Captured on the main thread and passed in; the worker never reads game state for identity.
+        string identity = stableIdentityKey;
 
         finderBusy = true;
         Task.Run(() => {
             try {
-                RecomputeMapFinder(atlas, queries, radius, maxExtra, hysteresis, previous);
+                RecomputeMapFinder(atlas, queries, radius, maxExtra, hysteresis, previous, identity);
             } catch (Exception e) {
                 LogError("Error computing map finder routes: " + e.Message + "\n" + e.StackTrace);
             } finally {
@@ -436,19 +581,49 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         });
     }
 
-    // Adds one directed edge to the accumulated adjacency, deduped. Worker thread only.
-    private void AddCachedEdge(Vector2i a, Vector2i b)
+    // Adds one directed edge to the accumulated adjacency, deduped. Returns true if it was new. Worker
+    // thread only.
+    private bool AddCachedEdge(Vector2i a, Vector2i b)
     {
         if (!cachedAdjacency.TryGetValue(a, out var set))
             cachedAdjacency[a] = set = new HashSet<Vector2i>();
-        set.Add(b);
+        return set.Add(b);
     }
 
     // Scans the atlas into a private graph, runs a multi-source BFS out from your completed/unlocked maps
     // (shared by every search), builds a proximity distance field per distinct optional, then scores each
     // search's candidates and publishes one result apiece. Also publishes the content tags for the dropdown.
-    private void RecomputeMapFinder(AtlasPanel atlas, List<PresetQuery> queries, int radius, int maxExtra, float hysteresis, List<FinderResult> previous)
+    private void RecomputeMapFinder(AtlasPanel atlas, List<PresetQuery> queries, int radius, int maxExtra, float hysteresis, List<FinderResult> previous, string currentIdentityKey)
     {
+        bool persistOn = Settings.PersistAtlas && !persistDisabled;
+
+        // Honor a manual Rescan first, before any load, so the wipe is never undone by a same-pass
+        // reload. Rescan also forgets the saved file for this character (persistForgetRequested).
+        if (finderClearCacheRequested) {
+            finderClearCacheRequested = false;
+            bool forget = persistForgetRequested;
+            persistForgetRequested = false;
+            cachedNodes.Clear();
+            cachedAdjacency.Clear();
+            cachedNodeCount = 0;
+            persistDirty = false;
+            swapSignalStreak = 0;
+            if (persistOn && forget && loadedIdentityKey != null)
+                ForgetSnapshotFiles(loadedIdentityKey);
+        }
+
+        // Switch the remembered graph when the character/league changes (or first resolves). Loads from
+        // disk into the cache; on any failure the cache is left empty for that character, not crashed.
+        bool justLoaded = false;
+        if (persistOn && currentIdentityKey != null && currentIdentityKey != loadedIdentityKey) {
+            EnsureCacheForIdentity(currentIdentityKey);
+            justLoaded = true;
+        }
+
+        // Flush the remembered graph if a checkpoint asked for it. Done before the atlas-readability
+        // returns below so the flush still happens when the atlas has already been closed.
+        PersistIfDue();
+
         if (atlas == null) {
             mapFinderResults = new List<FinderResult>();
             return;
@@ -464,19 +639,15 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         if (descs.Count == 0)
             return;   // atlas momentarily unreadable - keep the previous result instead of blanking the panel
 
-        // Honor a pending cache wipe (manual rescan, or an atlas-change auto-detect).
-        if (finderClearCacheRequested) {
-            finderClearCacheRequested = false;
-            cachedNodes.Clear();
-            cachedAdjacency.Clear();
-        }
-
         // Snapshot the nodes visible this scan and compare against the cache to spot an atlas swap, so a stale
         // cache is dropped before this scan is merged in. Two signals: many renamed coords (a different atlas
         // layout), or completed maps that are suddenly incomplete - a map can never un-complete for the same
         // character, so that means a different character is reusing the coordinate space (map names are stable
         // across characters, so the name signal alone would miss a character swap).
         int reseen = 0, nameMismatches = 0, visitedRegressions = 0;
+        // Tracks whether this scan changed anything worth re-saving (the SeenLive flag flipping does not
+        // count - it is session state, not persisted).
+        bool changed = false;
         var freshThisScan = new List<GraphNode>(descs.Count);
         foreach (var d in descs) {
             var coord = d.Coordinate;
@@ -497,12 +668,20 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             string name = null;
             try { name = el.Area?.Name; } catch { }
 
+            var tags = CollectContentTags(el);
+
             if (cachedNodes.TryGetValue(coord, out var old) && old != null) {
                 reseen++;
                 if (old.Name != null && name != null && !string.Equals(old.Name, name, StringComparison.Ordinal))
                     nameMismatches++;
                 if (old.Visited && !visited)
                     visitedRegressions++;
+                if (old.Visited != visited || old.Unlocked != unlocked
+                    || !string.Equals(old.Name, name, StringComparison.Ordinal)
+                    || (old.ContentTags?.Count ?? 0) != tags.Count)
+                    changed = true;
+            } else {
+                changed = true;   // a coordinate never seen before
             }
 
             freshThisScan.Add(new GraphNode {
@@ -511,13 +690,30 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 Visited = visited,
                 Unlocked = unlocked,
                 Active = active,
-                ContentTags = CollectContentTags(el)
+                ContentTags = tags,
+                SeenLive = true,
             });
         }
 
-        if ((reseen >= 10 && nameMismatches > reseen / 2) || visitedRegressions >= 3) {
+        // The swap signal alone is noisy: right after an instance reload the atlas UI repopulates and a
+        // handful of completed maps can momentarily read unvisited, which used to wipe the whole cache.
+        // Require the signal to hold for several scans in a row, and never act on the pass that just
+        // loaded a file from disk (its nodes have not been confirmed against a live viewport yet). A
+        // genuine character/atlas swap is caught deterministically by identity keying instead.
+        bool swapSignal = (reseen >= 10 && nameMismatches > reseen / 2) || visitedRegressions >= 3;
+        if (justLoaded)
+            swapSignal = false;
+        swapSignalStreak = swapSignal ? swapSignalStreak + 1 : 0;
+        if (swapSignalStreak >= SwapConfirmScans) {
+            swapSignalStreak = 0;
             cachedNodes.Clear();
             cachedAdjacency.Clear();
+            cachedNodeCount = 0;
+            persistDirty = false;
+            // The live atlas persistently disagrees with the remembered graph (a relayout, or a different
+            // character reusing this name+league); forget the file so it can't reload the bad data.
+            if (persistOn && loadedIdentityKey != null)
+                ForgetSnapshotFiles(loadedIdentityKey);
         }
 
         // Merge this scan's connections into the accumulated adjacency. Links are bidirectional and
@@ -533,8 +729,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 foreach (var target in targets) {
                     if (target == default)
                         continue;
-                    AddCachedEdge(source, target);
-                    AddCachedEdge(target, source);
+                    if (AddCachedEdge(source, target)) changed = true;
+                    if (AddCachedEdge(target, source)) changed = true;
                 }
             }
         } catch {
@@ -547,6 +743,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         foreach (var gn in freshThisScan)
             cachedNodes[gn.Coord] = gn;
         cachedNodeCount = cachedNodes.Count;
+        if (changed)
+            persistDirty = true;
 
         // The accumulated cache IS the working graph for this scan.
         var nodes = cachedNodes.Values.ToList();
@@ -591,7 +789,11 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         // Only seed from nodes that actually have connections, so an ungenerated phantom flagged unlocked
         // can't seed itself as a 0-step target. If connections couldn't be read at all, seed normally.
         bool Connected(GraphNode n) => !haveConnections || adjacency.ContainsKey(n.Coord);
-        Seed(n => (n.Visited || n.Unlocked) && Connected(n));
+        // Visited is monotonic (a map cannot un-complete for the same character), so a remembered Visited
+        // node always seeds the frontier. Unlocked is decayable, so a node restored from disk seeds only
+        // once it has been reconfirmed live this session - otherwise a stale region's old frontier could
+        // pose as "where you can already stand" and understate distances or hijack the route.
+        Seed(n => (n.Visited || (n.Unlocked && n.SeenLive)) && Connected(n));
         if (queue.Count == 0)
             Seed(n => n.Active && Connected(n));
 
@@ -640,6 +842,9 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             return;
 
         mapFinderResults = results;
+
+        // Persist the freshly-merged graph (debounced, worker-side). PersistIfDue re-checks the wipe flag.
+        PersistIfDue();
     }
 
     // Multi-source BFS out from a set of optional instances, capped at the corridor radius. Each reached
@@ -887,12 +1092,18 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             compGroups[r].Add(candGroup[i]);
         }
 
-        int bestRoot = -1, bestGroups = -1, bestNearest = INF;
+        // Prefer the component covering the most groups; then, among ties, the one with the most candidates
+        // confirmed live this session (so a stale region restored from disk doesn't out-rank the region the
+        // player is actually in); then the nearer one.
+        int bestRoot = -1, bestGroups = -1, bestLive = -1, bestNearest = INF;
         foreach (var kv in compCands) {
             int groups = compGroups[kv.Key].Count;
             int nearest = kv.Value.Min(Start);
-            if (groups > bestGroups || (groups == bestGroups && nearest < bestNearest)) {
-                bestGroups = groups; bestNearest = nearest; bestRoot = kv.Key;
+            int live = kv.Value.Count(ci => cand[ci].Node.SeenLive);
+            if (groups > bestGroups
+                || (groups == bestGroups && live > bestLive)
+                || (groups == bestGroups && live == bestLive && nearest < bestNearest)) {
+                bestGroups = groups; bestLive = live; bestNearest = nearest; bestRoot = kv.Key;
             }
         }
 
@@ -1473,6 +1684,290 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
     #endregion
 
+    #region Persistence
+
+    // Characters illegal in a filename, mapped to '_' so a (league, character) key is always a valid name.
+    private static readonly char[] InvalidFileChars = Path.GetInvalidFileNameChars();
+
+    private static string Sanitize(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "_";
+        var sb = new StringBuilder(value.Length);
+        foreach (char c in value.Trim())
+            sb.Append(Array.IndexOf(InvalidFileChars, c) >= 0 ? '_' : c);
+        string s = sb.ToString();
+        return s.Length == 0 ? "_" : s;
+    }
+
+    private string AtlasDir => Path.Combine(ConfigDirectory, "atlas");
+    private string GetGraphPath(string key) => Path.Combine(AtlasDir, key + ".json");
+
+    // Creates the save folder once and probes that it is writable; on failure disables persistence for
+    // the session instead of throwing on every scan. Worker-only.
+    private bool EnsurePersistDir()
+    {
+        if (persistDisabled)
+            return false;
+        if (persistDirReady)
+            return true;
+        try {
+            Directory.CreateDirectory(AtlasDir);
+            persistDirReady = true;
+            return true;
+        } catch (Exception e) {
+            persistDisabled = true;
+            LogError("OptiPather: atlas memory disabled - cannot create " + AtlasDir + ": " + e.Message);
+            return false;
+        }
+    }
+
+    // Worker-only. Writes the graph when a checkpoint flush is pending or the debounce has elapsed and
+    // something changed. Always resolves a pending flush so the request cannot get stuck set.
+    private void PersistIfDue()
+    {
+        if (!Settings.PersistAtlas || persistDisabled || loadedIdentityKey == null)
+            return;
+        if (finderClearCacheRequested)
+            return;   // a wipe is pending - don't write the graph that is about to be discarded
+        bool flush = persistFlushRequested;
+        bool due = flush || (persistDirty && (DateTime.Now - lastPersistSave).TotalSeconds > SaveDebounceSeconds);
+        if (due && persistDirty)
+            SaveSnapshot(loadedIdentityKey);
+        if (flush)
+            persistFlushRequested = false;
+    }
+
+    // Worker-only. Switches the in-memory cache to the given character: saves the outgoing graph if it has
+    // unsaved changes, then replaces the cache with that character's saved graph. If an existing file could
+    // not be read this pass (a concurrent write from another instance, or transient IO), the switch is NOT
+    // committed and nothing is wiped - it retries next scan, so good data is never overwritten with an empty
+    // graph after a failed read.
+    private void EnsureCacheForIdentity(string currentKey)
+    {
+        if (loadedIdentityKey != null && persistDirty)
+            SaveSnapshot(loadedIdentityKey);
+
+        if (!TryLoadSnapshot(currentKey, out var nodes, out var adjacency, out var age))
+            return;   // existing file unreadable this pass - keep current state, retry next scan
+
+        cachedNodes.Clear();
+        foreach (var kv in nodes)
+            cachedNodes[kv.Key] = kv.Value;
+        cachedAdjacency.Clear();
+        foreach (var kv in adjacency)
+            cachedAdjacency[kv.Key] = kv.Value;
+
+        persistDirty = false;
+        swapSignalStreak = 0;
+        cacheRememberedAge = age;
+        loadedIdentityKey = currentKey;
+        cachedNodeCount = cachedNodes.Count;
+        lastPersistSave = DateTime.Now;   // freshly in sync with disk - don't immediately re-save
+    }
+
+    // Worker-only. Builds the saved graph into fresh dictionaries (never mutating the live cache) and
+    // validates it. Returns false only when an EXISTING file could not be read this pass (lock held by
+    // another instance, or an IO/parse exception) - the caller must then keep the current cache and retry,
+    // never overwrite. Returns true (with empty maps) when there is simply no file or the file is invalid
+    // and should be discarded. Active is never trusted from disk; SeenLive starts false so loaded state is
+    // reconfirmed by the live scan before it seeds the frontier.
+    private bool TryLoadSnapshot(string key, out Dictionary<Vector2i, GraphNode> nodes, out Dictionary<Vector2i, HashSet<Vector2i>> adjacency, out string age)
+    {
+        nodes = new Dictionary<Vector2i, GraphNode>();
+        adjacency = new Dictionary<Vector2i, HashSet<Vector2i>>();
+        age = null;
+
+        if (!EnsurePersistDir())
+            return true;   // persistence unavailable - proceed with an empty cache
+        string path = GetGraphPath(key);
+        if (!File.Exists(path))
+            return true;   // no remembered graph yet - start empty, fine to save later
+
+        FileStream lockStream = null;
+        try {
+            try {
+                lockStream = new FileStream(path + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            } catch {
+                return false;   // another instance is writing this file - retry, don't overwrite it
+            }
+
+            GraphSnapshot snap;
+            using (var sr = new StreamReader(path))
+            using (var jr = new Newtonsoft.Json.JsonTextReader(sr)) {
+                snap = Newtonsoft.Json.JsonSerializer.CreateDefault().Deserialize<GraphSnapshot>(jr);
+            }
+
+            if (snap == null || snap.SchemaVersion != GraphSchemaVersion
+                || !string.Equals(snap.IdentityKey, key, StringComparison.Ordinal)
+                || snap.Nodes == null || snap.Nodes.Count == 0 || snap.Nodes.Count > MaxPersistNodes)
+                return true;   // missing / different format / foreign / implausible - discard and rebuild
+
+            var loadedNodes = new Dictionary<Vector2i, GraphNode>(snap.Nodes.Count);
+            foreach (var nd in snap.Nodes) {
+                if (nd == null)
+                    continue;
+                var coord = new Vector2i(nd.X, nd.Y);
+                loadedNodes[coord] = new GraphNode {
+                    Coord = coord,
+                    Name = nd.Name,
+                    Visited = nd.V,
+                    Unlocked = nd.U,
+                    Active = false,
+                    ContentTags = nd.T ?? new List<string>(),
+                    SeenLive = false,
+                };
+            }
+
+            var loadedAdj = new Dictionary<Vector2i, HashSet<Vector2i>>(loadedNodes.Count);
+            void AddEdge(Vector2i a, Vector2i b) {
+                if (!loadedNodes.ContainsKey(a) || !loadedNodes.ContainsKey(b))
+                    return;   // drop a dangling edge rather than referencing a missing node
+                if (!loadedAdj.TryGetValue(a, out var set))
+                    loadedAdj[a] = set = new HashSet<Vector2i>();
+                set.Add(b);
+            }
+            if (snap.Edges != null)
+                foreach (var ed in snap.Edges) {
+                    if (ed == null)
+                        continue;
+                    var a = new Vector2i(ed.AX, ed.AY);
+                    var b = new Vector2i(ed.BX, ed.BY);
+                    AddEdge(a, b);
+                    AddEdge(b, a);
+                }
+
+            nodes = loadedNodes;
+            adjacency = loadedAdj;
+            age = DescribeAge(snap.SavedUtc);
+            return true;
+        } catch (Exception e) {
+            LogError("OptiPather: could not read remembered atlas " + path + ": " + e.Message);
+            nodes = new Dictionary<Vector2i, GraphNode>();
+            adjacency = new Dictionary<Vector2i, HashSet<Vector2i>>();
+            return false;   // existed but unreadable this pass - keep current cache, retry next scan
+        } finally {
+            try { lockStream?.Dispose(); } catch { }
+        }
+    }
+
+    // Worker-only. Serializes the current cache to a unique temp file and atomically renames it onto the
+    // final path, behind a per-file lock so two overlapping instances (hot-reload) never corrupt it.
+    private void SaveSnapshot(string key)
+    {
+        if (string.IsNullOrEmpty(key) || !EnsurePersistDir())
+            return;
+
+        string path = GetGraphPath(key);
+        string lockPath = path + ".lock";
+        string tmpPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        FileStream lockStream = null;
+        try {
+            try {
+                lockStream = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            } catch {
+                return;   // another instance owns this file this pass - skip rather than race
+            }
+
+            CleanOrphanTemps(path);
+
+            var snap = new GraphSnapshot {
+                SchemaVersion = GraphSchemaVersion,
+                IdentityKey = key,
+                SavedUtc = DateTime.UtcNow,
+                NodeCount = cachedNodes.Count,
+                Nodes = new List<NodeDto>(cachedNodes.Count),
+                Edges = new List<EdgeDto>(cachedNodes.Count),
+            };
+            foreach (var kv in cachedNodes) {
+                var n = kv.Value;
+                snap.Nodes.Add(new NodeDto {
+                    X = n.Coord.X,
+                    Y = n.Coord.Y,
+                    Name = n.Name,
+                    V = n.Visited,
+                    U = n.Unlocked,
+                    T = n.ContentTags is { Count: > 0 } ? n.ContentTags : null,
+                });
+            }
+            foreach (var kv in cachedAdjacency) {
+                var a = kv.Key;
+                foreach (var b in kv.Value)
+                    if (a.X < b.X || (a.X == b.X && a.Y < b.Y))   // one direction per undirected pair
+                        snap.Edges.Add(new EdgeDto { AX = a.X, AY = a.Y, BX = b.X, BY = b.Y });
+            }
+
+            using (var sw = new StreamWriter(tmpPath, false))
+            using (var jw = new Newtonsoft.Json.JsonTextWriter(sw)) {
+                Newtonsoft.Json.JsonSerializer.CreateDefault().Serialize(jw, snap);
+            }
+
+            try {
+                File.Move(tmpPath, path, true);
+            } catch {
+                if (File.Exists(path))
+                    File.Replace(tmpPath, path, path + ".bak");
+                else
+                    File.Move(tmpPath, path);
+            }
+
+            lastPersistSave = DateTime.Now;
+            persistDirty = false;
+            persistFlushRequested = false;
+            cacheRememberedAge = DescribeAge(snap.SavedUtc);
+        } catch (Exception e) {
+            LogError("OptiPather: could not save remembered atlas " + path + ": " + e.Message);
+            // leave persistDirty set so the next pass retries
+        } finally {
+            try { lockStream?.Dispose(); } catch { }
+            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+        }
+    }
+
+    // Worker-only. Removes the saved file for a character (manual Rescan, or a confirmed swap), keeping a
+    // single .bak so an accidental forget is recoverable.
+    private void ForgetSnapshotFiles(string key)
+    {
+        if (string.IsNullOrEmpty(key) || !EnsurePersistDir())
+            return;
+        string path = GetGraphPath(key);
+        try {
+            if (File.Exists(path))
+                File.Move(path, path + ".bak", true);
+        } catch {
+            try { File.Delete(path); } catch { }
+        }
+        CleanOrphanTemps(path);
+        cacheRememberedAge = null;
+    }
+
+    private void CleanOrphanTemps(string finalPath)
+    {
+        try {
+            string dir = Path.GetDirectoryName(finalPath);
+            string name = Path.GetFileName(finalPath);
+            if (dir == null)
+                return;
+            foreach (var f in Directory.EnumerateFiles(dir, name + ".*.tmp"))
+                try { File.Delete(f); } catch { }
+        } catch { }
+    }
+
+    private static string DescribeAge(DateTime savedUtc)
+    {
+        if (savedUtc == default)
+            return null;
+        var span = DateTime.UtcNow - savedUtc;
+        if (span < TimeSpan.Zero)
+            span = TimeSpan.Zero;
+        if (span.TotalMinutes < 1) return "just now";
+        if (span.TotalMinutes < 60) return (int)span.TotalMinutes + "m ago";
+        if (span.TotalHours < 24) return (int)span.TotalHours + "h ago";
+        return (int)span.TotalDays + "d ago";
+    }
+
+    #endregion
+
     #region Rendering
 
     private void DrawMapFinderRoutes()
@@ -1643,10 +2138,13 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 if (!IsOnScreen(ctr))
                     continue;
                 float rad = ((rect.Right - rect.Left) / 2 * Settings.RingRadius) + 10;
-                Graphics.DrawCircle(ctr, rad, color, Settings.RingWidth, 32);
+                bool stopUnconfirmed = !stop.Node.SeenLive;
+                Graphics.DrawCircle(ctr, rad, stopUnconfirmed ? Dimmed(color) : color, Settings.RingWidth, 32);
                 string nm = stop.Node.Name ?? "(unknown)";
                 string desc = stop.MatchedContent != null ? $"{nm} - {stop.MatchedContent}" : nm;
                 string lbl = $"{prefix}{stop.Order}. {desc} ({stop.CumulativeSteps})";
+                if (stopUnconfirmed)
+                    lbl += "  (unconfirmed)";
                 DrawCenteredTextWithBackground(lbl, ctr - new Vector2(0, rad + 12), Settings.FontColor, Settings.BackgroundColor, true, 10, 4);
             }
         } else if (descByCoord.TryGetValue(target.Coord, out var targetDesc)) {
@@ -1657,8 +2155,13 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                     string tName = target.Name ?? "(unknown)";
                     string tDesc = route.TargetContent != null ? $"{tName} - {route.TargetContent}" : tName;
                     string tLabel = route.Steps >= 0 ? $"{prefix}{tDesc} ({route.Steps} steps)" : $"{prefix}{tDesc}";
+                    // A target restored from the saved graph but not yet re-seen this session is drawn faint
+                    // and tagged, since its completed/unlocked state may be out of date until reconfirmed.
+                    bool unconfirmed = !target.SeenLive;
+                    if (unconfirmed)
+                        tLabel += "  (unconfirmed)";
                     float radius = ((targetRect.Right - targetRect.Left) / 2 * Settings.RingRadius) + 10;
-                    Graphics.DrawCircle(targetCenter, radius, color, Settings.RingWidth, 32);
+                    Graphics.DrawCircle(targetCenter, radius, unconfirmed ? Dimmed(color) : color, Settings.RingWidth, 32);
                     DrawCenteredTextWithBackground(tLabel, targetCenter - new Vector2(0, radius + 12), Settings.FontColor, Settings.BackgroundColor, true, 10, 4);
                 }
             } catch { }
@@ -1679,9 +2182,12 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             if (distance >= 400 || !isLive) {
                 string tName = target.Name ?? "(unknown)";
                 string tDesc = route.TargetContent != null ? $"{tName} - {route.TargetContent}" : tName;
+                bool arrowUnconfirmed = !target.SeenLive;
                 string arrowLabel = multi
                     ? $"{prefix}Next: {tDesc}  ({route.Steps} total)"
                     : (route.Steps >= 0 ? $"{prefix}{tDesc} ({route.Steps} steps)" : $"{prefix}{tDesc}");
+                if (arrowUnconfirmed)
+                    arrowLabel += "  (unconfirmed)";
 
                 Vector2 arrowSize = new(64, 64);
                 var windowSize = GameController.Window.GetWindowRectangleTimeCache.Size;
@@ -1694,7 +2200,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 Vector2 direction = tpos - screenCenter;
                 float phi = (float)Math.Atan2(direction.Y, direction.X) + (float)(Math.PI / 2);
 
-                Color arrowColor = Color.FromArgb(255, color);
+                Color arrowColor = arrowUnconfirmed ? Color.FromArgb(150, color) : Color.FromArgb(255, color);
                 DrawRotatedImage(arrowId, arrowPosition, arrowSize, phi, arrowColor);
 
                 Vector2 textPosition = arrowPosition + new Vector2(arrowSize.X / 2, arrowSize.Y / 2);
@@ -1953,16 +2459,22 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 DeletePreset(selectedPresetIndex);
 
             ImGui.Separator();
-            ImGui.TextDisabled($"{cachedNodeCount} maps cached");
+            if (persistDisabled) {
+                ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f), "Atlas memory disabled (cannot write to disk)");
+            } else {
+                string age = cacheRememberedAge;
+                ImGui.TextDisabled(age != null ? $"{cachedNodeCount} maps cached - remembered {age}" : $"{cachedNodeCount} maps cached");
+            }
             if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Maps remembered from everywhere you have panned over. The search covers all of them, not just what is on screen now - so pan around once and the finder keeps seeing those directions.");
+                ImGui.SetTooltip("Maps remembered from everywhere you have panned over, saved to disk per character so they survive a game restart or plugin reload. Maps you completed while the atlas was closed may show faint and 'unconfirmed' until you pan over them again.");
             if (ImGui.Button("Rescan", new Vector2(-1, 0))) {
                 finderClearCacheRequested = true;
+                persistForgetRequested = true;
                 mapFinderResults = new List<FinderResult>();   // drop stale results now; the rebuild republishes
                 mapFinderDirty = true;
             }
             if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Forget the remembered maps and rebuild from what is on screen. Use after switching atlas / character if the results look stale.");
+                ImGui.SetTooltip("Forget the remembered maps (including the saved file for this character) and rebuild from what is on screen. Use after a major atlas change if the results look stale.");
         } finally {
             ImGui.EndChild();
         }
@@ -2553,6 +3065,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         (int)(Math.Clamp(v.X, 0f, 1f) * 255),
         (int)(Math.Clamp(v.Y, 0f, 1f) * 255),
         (int)(Math.Clamp(v.Z, 0f, 1f) * 255));
+
+    // A faint version of a route color, used to draw targets restored from the saved graph but not yet
+    // reconfirmed live this session.
+    private static Color Dimmed(Color c) => Color.FromArgb(110, c.R, c.G, c.B);
 
     #endregion
 }
