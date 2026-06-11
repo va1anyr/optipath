@@ -30,9 +30,7 @@ namespace OptiPather;
 // loop only resolves live node positions for drawing.
 public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 {
-    public const string Version = "2.2.0";
-
-    private const string ArrowTextureKey = "optipather_arrow.png";
+    public const string Version = "2.2.6";
 
     // On-disk graph format version. Bump on any schema change to NodeDto/EdgeDto/GraphSnapshot;
     // a file written by a different version is discarded and rebuilt by re-panning the atlas.
@@ -47,6 +45,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     private const int SwapConfirmScans = 3;
     // How many ticks a (league, character) reading must repeat before it is trusted as the live key.
     private const int IdentityStableTicks = 3;
+
+    private const string ArrowTextureKey = "optipather_arrow.png";
 
     private IngameUIElements UI;
     private AtlasPanel AtlasPanel;
@@ -107,6 +107,9 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     private volatile bool persistDisabled = false;
     // SavedUtc of the file the current cache was loaded from, surfaced as a "remembered ago" readout.
     private volatile string cacheRememberedAge = null;
+    // Last notable cache lifecycle event (restore, auto-reset), surfaced in the panel so an unexpected
+    // loss of remembered maps is attributable instead of silent.
+    private volatile string lastCacheEvent = null;
     // Worker-local persistence bookkeeping (touched only inside the scan worker).
     private DateTime lastPersistSave = DateTime.MinValue;
     private bool persistDirty = false;
@@ -362,6 +365,11 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         // hidden, so this is the last chance to save what was panned over before the player runs a map.
         if (atlasWasVisible && !visible) {
             atlasWasVisible = false;
+            // The camera at the next reopen is unrelated to the close-time one - a held fit from the
+            // old viewport must never bridge the gap. The first refit after reopen rebuilds it.
+            heldFitSet = false;
+            hardRejectStreak = 0;
+            fitCacheAt = DateTime.MinValue;
             if (Settings.PersistAtlas && !persistDisabled && loadedIdentityKey != null) {
                 persistFlushRequested = true;
                 if (!finderBusy) {
@@ -624,8 +632,14 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         // returns below so the flush still happens when the atlas has already been closed.
         PersistIfDue();
 
-        if (atlas == null) {
-            mapFinderResults = new List<FinderResult>();
+        // A pass dispatched while the atlas is closed (the close-time flush, or a panel torn down by a
+        // loading screen) is persistence-only. A hidden panel's elements can read zeroed without throwing,
+        // and merging those reads would overwrite good remembered state with garbage - so never scan one,
+        // and keep the previously published routes; they are redrawn the moment the atlas reopens.
+        bool atlasReadable = false;
+        try { atlasReadable = atlas is { IsVisible: true }; } catch { }
+        if (!atlasReadable) {
+            swapSignalStreak = 0;   // the streak counts consecutive readable scans, not scans-with-gaps
             return;
         }
 
@@ -633,11 +647,14 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         try {
             descs = atlas.Descriptions?.ToList() ?? [];
         } catch {
+            swapSignalStreak = 0;
             return;   // not readable this pass - keep the previous result
         }
 
-        if (descs.Count == 0)
+        if (descs.Count == 0) {
+            swapSignalStreak = 0;
             return;   // atlas momentarily unreadable - keep the previous result instead of blanking the panel
+        }
 
         // Snapshot the nodes visible this scan and compare against the cache to spot an atlas swap, so a stale
         // cache is dropped before this scan is merged in. Two signals: many renamed coords (a different atlas
@@ -669,13 +686,44 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             try { name = el.Area?.Name; } catch { }
 
             var tags = CollectContentTags(el);
+            bool elementLoaded = !string.IsNullOrEmpty(name);
+            bool seenLive = true;
 
             if (cachedNodes.TryGetValue(coord, out var old) && old != null) {
                 reseen++;
-                if (old.Name != null && name != null && !string.Equals(old.Name, name, StringComparison.Ordinal))
-                    nameMismatches++;
-                if (old.Visited && !visited)
-                    visitedRegressions++;
+                // The swap tally compares RAW reads against the cache, and only for elements that are
+                // actually loaded - an unloaded one reads a blank name and all-false flags, which is
+                // noise, not evidence. The merge below decides what the cache keeps, so a genuine swap
+                // (elements load fine yet keep reading visited=false against a remembered true) re-fires
+                // the signal scan after scan until the streak confirms, while a transient bad read never
+                // becomes the baseline it would need to hide behind.
+                if (elementLoaded) {
+                    if (!string.IsNullOrEmpty(old.Name) && !string.Equals(old.Name, name, StringComparison.Ordinal))
+                        nameMismatches++;
+                    if (old.Visited && !visited)
+                        visitedRegressions++;
+                }
+
+                // Merge defensively: while the panel repopulates after an instance reload, an element can
+                // momentarily read blank/all-false without throwing, and committing such a read used to
+                // silently poison the remembered graph (no seeds, no matches) until the user panned back
+                // over it. An unloaded element contributes nothing - the remembered node is kept as-is,
+                // including whether it was ever seen live, so a garbage read can never pass for live
+                // confirmation. A loaded element is trusted, except that Visited stays monotonic for one
+                // character (a map never un-completes; a real swap is handled by the confirmed wipe below)
+                // and that content tags, which populate later than the name, never collapse to empty.
+                if (!elementLoaded) {
+                    name = old.Name;
+                    visited = old.Visited;
+                    unlocked = old.Unlocked;
+                    tags = old.ContentTags ?? tags;
+                    seenLive = old.SeenLive;
+                } else {
+                    visited |= old.Visited;
+                    if (tags.Count == 0 && old.ContentTags is { Count: > 0 })
+                        tags = old.ContentTags;
+                }
+
                 if (old.Visited != visited || old.Unlocked != unlocked
                     || !string.Equals(old.Name, name, StringComparison.Ordinal)
                     || (old.ContentTags?.Count ?? 0) != tags.Count)
@@ -691,7 +739,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 Unlocked = unlocked,
                 Active = active,
                 ContentTags = tags,
-                SeenLive = true,
+                SeenLive = seenLive,
             });
         }
 
@@ -704,6 +752,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         if (justLoaded)
             swapSignal = false;
         swapSignalStreak = swapSignal ? swapSignalStreak + 1 : 0;
+        if (swapSignal)
+            LogMessage($"OptiPather: live atlas disagrees with remembered graph (regressions {visitedRegressions}, renames {nameMismatches}/{reseen}) - {swapSignalStreak}/{SwapConfirmScans}");
         if (swapSignalStreak >= SwapConfirmScans) {
             swapSignalStreak = 0;
             cachedNodes.Clear();
@@ -714,6 +764,13 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             // character reusing this name+league); forget the file so it can't reload the bad data.
             if (persistOn && loadedIdentityKey != null)
                 ForgetSnapshotFiles(loadedIdentityKey);
+            cacheRememberedAge = null;
+            lastCacheEvent = "remembered maps reset (atlas no longer matched)";
+            // Routes computed from the dropped graph must not keep drawing on what is now known to be a
+            // different atlas; this scan was also tallied and clamped against that graph, so none of its
+            // snapshots can be trusted either - rebuild from the next clean scan instead of merging.
+            mapFinderResults = new List<FinderResult>();
+            return;
         }
 
         // Merge this scan's connections into the accumulated adjacency. Links are bidirectional and
@@ -1764,6 +1821,9 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         loadedIdentityKey = currentKey;
         cachedNodeCount = cachedNodes.Count;
         lastPersistSave = DateTime.Now;   // freshly in sync with disk - don't immediately re-save
+        lastCacheEvent = cachedNodes.Count > 0
+            ? $"restored {cachedNodes.Count} maps from disk" + (age != null ? $" ({age})" : "")
+            : null;
     }
 
     // Worker-only. Builds the saved graph into fresh dictionaries (never mutating the live cache) and
@@ -1987,8 +2047,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         foreach (var r in results) {
             if (r?.Target == null || r.Target.Visited)
                 continue;
-            bool active = presets != null && r.PresetIndex >= 0 && r.PresetIndex < presets.Count && presets[r.PresetIndex].Active;
-            if (active)
+            if (presets != null && r.PresetIndex >= 0 && r.PresetIndex < presets.Count && presets[r.PresetIndex].Active)
                 drawList.Add(r);
         }
         if (drawList.Count == 0)
@@ -2013,31 +2072,75 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             descByCoord = new Dictionary<Vector2i, AtlasNodeDescription>(descs.Count);
             foreach (var d in descs)
                 descByCoord[d.Coordinate] = d;
-        } catch { return; }
+        } catch {
+            return;
+        }
 
-        // Fit the atlas coord->screen transform from the on-screen nodes, so off-screen targets (cached but
-        // not currently rendered) can still be pointed at. The fit reads each sampled node's screen rect
-        // (a per-call game-memory walk), so only pay for it when it can actually be used: far arrows enabled
-        // AND at least one drawn target is genuinely off screen. Checking "off screen" is a free dictionary
-        // lookup (a live element exists iff the coord is in descByCoord) - no rect read. In the common case
-        // every target is on screen, so the fit is skipped entirely and an invalid (unused) transform passes.
+        // Fit the atlas coord->screen transform from the on-screen nodes whenever any piece of a drawn
+        // route has no live element to anchor to. The game rebuilds the panel's element list around the
+        // camera on every instance reload, so right after a map run most of a remembered route has no
+        // elements until the player pans back over it - the transform fills that gap by projecting the
+        // remembered coordinates instead, keeping the route visible. Deciding whether the fit is needed
+        // costs dictionary lookups only (a live element exists iff the coord is in descByCoord); the fit
+        // itself stays capped at 3*FitGridDim^2 rect reads. In the common case everything is live and the
+        // fit is skipped entirely.
         AtlasTransform transform = default;   // Valid == false
-        if (Settings.ShowArrow && Settings.ShowFarArrows) {
-            bool anyOffScreen = false;
-            foreach (var r in drawList) {
-                var tg = r.Target;
-                if (tg != null && !tg.Visited && !descByCoord.ContainsKey(tg.Coord)) {
-                    anyOffScreen = true;
-                    break;
-                }
+        bool needFit = false;
+        foreach (var r in drawList) {
+            if (r.Target != null && !descByCoord.ContainsKey(r.Target.Coord))
+                needFit = true;
+            if (!needFit && Settings.ShowPath && r.Path != null)
+                foreach (var pn in r.Path)
+                    if (pn != null && !descByCoord.ContainsKey(pn.Coord)) { needFit = true; break; }
+            if (!needFit && r.Stops != null)
+                foreach (var s in r.Stops)
+                    if (s?.Node != null && !descByCoord.ContainsKey(s.Node.Coord)) { needFit = true; break; }
+            if (!needFit && r.NearOptionals != null)
+                foreach (var no in r.NearOptionals)
+                    if (no?.Node != null && !descByCoord.ContainsKey(no.Node.Coord)) { needFit = true; break; }
+            if (needFit)
+                break;
+        }
+        if (needFit && (DateTime.UtcNow - fitCacheAt).TotalSeconds >= FitReuseSeconds) {
+            // Refits pause whenever every route piece is live, so a gap since the last one starts a
+            // new episode - rejections from the previous one are not "consecutive" with this one.
+            if ((DateTime.UtcNow - fitCacheAt).TotalSeconds >= 2 * FitReuseSeconds)
+                hardRejectStreak = 0;
+            var fresh = FitAtlasTransform(descByCoord);
+            fitCacheAt = DateTime.UtcNow;
+            if (fresh.Valid) {
+                heldFit = fresh;
+                heldFitSet = true;
+                heldAnchorCoord = fitAnchorCoord;
+                heldAnchorScreen = fitAnchorScreen;
+                hardRejectStreak = 0;
+            } else if (fitRejectedMarginally) {
+                // Gate noise, not a broken mapping - keep drawing with the held fit.
+                hardRejectStreak = 0;
+            } else if (heldFitSet && ++hardRejectStreak >= HardRejectsToBlank) {
+                heldFitSet = false;
             }
-            if (anyOffScreen)
-                transform = FitAtlasTransform(descByCoord);
+        }
+        // The held fit pan-follows every frame, so estimated pieces track the camera between solves.
+        // It is offered even when every route coord has an element entry: a repopulating element can
+        // read a zeroed rect for a frame or two, and the draw path then needs a projection to keep
+        // that piece from blinking off. Outside a needFit episode no refits run to keep the held fit
+        // current, so there it is only trusted when the anchor confirms it matches the camera.
+        bool panAnchored = false;
+        if (heldFitSet) {
+            var followed = PanFollow(heldFit, descByCoord, out panAnchored);
+            if (needFit || panAnchored)
+                transform = followed;
         }
 
         bool labelWithName = drawList.Count > 1;
-        foreach (var route in drawList)
-            DrawSingleRoute(route, descByCoord, transform, labelWithName);
+        foreach (var route in drawList) {
+            try {
+                DrawSingleRoute(route, descByCoord, transform, labelWithName);
+            } catch (Exception e) {
+                LogError($"Error drawing route '{route.PresetName}': {e.Message}\n{e.StackTrace}");
+            }
+        }
     }
 
     private void DrawSingleRoute(FinderResult route, Dictionary<Vector2i, AtlasNodeDescription> descByCoord, AtlasTransform transform, bool labelWithName)
@@ -2050,26 +2153,24 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         string prefix = labelWithName && !string.IsNullOrEmpty(route.PresetName) ? $"[{route.PresetName}] " : "";
         bool multi = route.Stops != null && route.Stops.Count > 0;
 
-        // Path line - the full itinerary for a multi-stop route. Only segments with both ends on screen draw.
+        // Path line - the full itinerary for a multi-stop route. A node without a live element (the game
+        // only keeps elements near the camera, and drops the rest on every instance reload) is anchored by
+        // projecting its coordinate through the fitted transform; those segments draw slightly faded so
+        // live and remembered geometry stay tellable apart. Segments fully off screen are skipped.
         if (Settings.ShowPath && route.Path is { Count: > 1 }) {
             for (int i = 0; i < route.Path.Count - 1; i++) {
                 var a = route.Path[i];
                 var b = route.Path[i + 1];
                 if (a == null || b == null)
                     continue;
-                if (!descByCoord.TryGetValue(a.Coord, out var da) || !descByCoord.TryGetValue(b.Coord, out var db))
+                if (!TryNodeScreenPos(a, descByCoord, transform, out Vector2 start, out _, out bool estA)
+                    || !TryNodeScreenPos(b, descByCoord, transform, out Vector2 end, out _, out bool estB))
                     continue;
-
-                Vector2 start, end;
-                try {
-                    start = da.Element.GetClientRect().Center;
-                    end = db.Element.GetClientRect().Center;
-                } catch { continue; }
 
                 if (!IsOnScreen(start) && !IsOnScreen(end))
                     continue;
 
-                Graphics.DrawLine(start, end, Settings.LineWidth, color);
+                Graphics.DrawLine(start, end, Settings.LineWidth, estA || estB ? Faded(color, 170) : color);
             }
         }
 
@@ -2081,40 +2182,32 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             float detourWidth = Math.Max(1f, Settings.LineWidth - 1.5f);
             float optWidth = Math.Max(1f, Settings.RingWidth - 2f);
             foreach (var near in route.NearOptionals) {
-                if (near?.Node == null || !descByCoord.TryGetValue(near.Node.Coord, out var od))
+                if (near?.Node == null || !TryNodeScreenPos(near.Node, descByCoord, transform, out Vector2 oc, out float ohalf, out bool estOpt))
                     continue;
-                RectangleF orect;
-                try { orect = od.Element.GetClientRect(); }
-                catch { continue; }
-                Vector2 oc = orect.Center;
                 Color drawColor = near.InRange ? Color.FromArgb(165, color) : Color.FromArgb(110, 150, 150, 150);
+                if (estOpt)
+                    drawColor = Faded(drawColor, 120);
 
                 if (near.InRange && near.Detour is { Count: > 1 }) {
                     for (int i = 0; i < near.Detour.Count - 1; i++) {
-                        if (!descByCoord.TryGetValue(near.Detour[i].Coord, out var dn) || !descByCoord.TryGetValue(near.Detour[i + 1].Coord, out var dn2))
+                        if (!TryNodeScreenPos(near.Detour[i], descByCoord, transform, out Vector2 ds, out _, out _)
+                            || !TryNodeScreenPos(near.Detour[i + 1], descByCoord, transform, out Vector2 de, out _, out _))
                             continue;
-                        Vector2 ds, de;
-                        try { ds = dn.Element.GetClientRect().Center; de = dn2.Element.GetClientRect().Center; }
-                        catch { continue; }
                         if (!IsOnScreen(ds) && !IsOnScreen(de))
                             continue;
                         Graphics.DrawLine(ds, de, detourWidth, drawColor);
                     }
 
                     // Marker on the branch point - the optimal spot to leave the route for this optional.
-                    if (descByCoord.TryGetValue(near.Detour[0].Coord, out var bn)) {
-                        try {
-                            var brect = bn.Element.GetClientRect();
-                            Vector2 bc = brect.Center;
-                            if (IsOnScreen(bc))
-                                Graphics.DrawCircle(bc, ((brect.Right - brect.Left) / 2 * Settings.RingRadius) * 0.55f + 4, drawColor, optWidth, 16);
-                        } catch { }
+                    if (TryNodeScreenPos(near.Detour[0], descByCoord, transform, out Vector2 bc, out float bhalf, out _)
+                        && IsOnScreen(bc)) {
+                        Graphics.DrawCircle(bc, (bhalf * Settings.RingRadius) * 0.55f + 4, drawColor, optWidth, 16);
                     }
                 }
 
                 if (!IsOnScreen(oc))
                     continue;
-                float orad = ((orect.Right - orect.Left) / 2 * Settings.RingRadius) + 6;
+                float orad = ohalf * Settings.RingRadius + 6;
                 Graphics.DrawCircle(oc, orad, drawColor, optWidth, 24);
                 string optLabel = near.InRange
                     ? $"{near.Label}  ({near.Gap} hop{(near.Gap == 1 ? "" : "s")} off route)"
@@ -2124,22 +2217,20 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         }
 
         // Rings + labels: one per stop for a multi-stop route (numbered in visiting order), otherwise the
-        // single target. Only nodes the game is currently rendering get a ring; the arrow handles the rest.
+        // single target. A node the game is not currently rendering is anchored by its projected coordinate
+        // and ringed slightly faded; nodes the projection puts off screen are left to the arrow.
         if (multi) {
             foreach (var stop in route.Stops) {
                 if (stop?.Node == null || stop.Node.Visited)
                     continue;
-                if (!descByCoord.TryGetValue(stop.Node.Coord, out var sd))
+                if (!TryNodeScreenPos(stop.Node, descByCoord, transform, out Vector2 ctr, out float shalf, out bool estStop))
                     continue;
-                RectangleF rect;
-                try { rect = sd.Element.GetClientRect(); }
-                catch { continue; }
-                Vector2 ctr = rect.Center;
                 if (!IsOnScreen(ctr))
                     continue;
-                float rad = ((rect.Right - rect.Left) / 2 * Settings.RingRadius) + 10;
+                float rad = shalf * Settings.RingRadius + 10;
                 bool stopUnconfirmed = !stop.Node.SeenLive;
-                Graphics.DrawCircle(ctr, rad, stopUnconfirmed ? Dimmed(color) : color, Settings.RingWidth, 32);
+                Color ringColor = stopUnconfirmed ? Dimmed(color) : estStop ? Faded(color, 185) : color;
+                Graphics.DrawCircle(ctr, rad, ringColor, Settings.RingWidth, 32);
                 string nm = stop.Node.Name ?? "(unknown)";
                 string desc = stop.MatchedContent != null ? $"{nm} - {stop.MatchedContent}" : nm;
                 string lbl = $"{prefix}{stop.Order}. {desc} ({stop.CumulativeSteps})";
@@ -2147,33 +2238,35 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                     lbl += "  (unconfirmed)";
                 DrawCenteredTextWithBackground(lbl, ctr - new Vector2(0, rad + 12), Settings.FontColor, Settings.BackgroundColor, true, 10, 4);
             }
-        } else if (descByCoord.TryGetValue(target.Coord, out var targetDesc)) {
-            try {
-                var targetRect = targetDesc.Element.GetClientRect();
-                Vector2 targetCenter = targetRect.Center;
-                if (IsOnScreen(targetCenter)) {
-                    string tName = target.Name ?? "(unknown)";
-                    string tDesc = route.TargetContent != null ? $"{tName} - {route.TargetContent}" : tName;
-                    string tLabel = route.Steps >= 0 ? $"{prefix}{tDesc} ({route.Steps} steps)" : $"{prefix}{tDesc}";
-                    // A target restored from the saved graph but not yet re-seen this session is drawn faint
-                    // and tagged, since its completed/unlocked state may be out of date until reconfirmed.
-                    bool unconfirmed = !target.SeenLive;
-                    if (unconfirmed)
-                        tLabel += "  (unconfirmed)";
-                    float radius = ((targetRect.Right - targetRect.Left) / 2 * Settings.RingRadius) + 10;
-                    Graphics.DrawCircle(targetCenter, radius, unconfirmed ? Dimmed(color) : color, Settings.RingWidth, 32);
-                    DrawCenteredTextWithBackground(tLabel, targetCenter - new Vector2(0, radius + 12), Settings.FontColor, Settings.BackgroundColor, true, 10, 4);
-                }
-            } catch { }
+        } else if (TryNodeScreenPos(target, descByCoord, transform, out Vector2 targetCenter, out float thalf, out bool estTarget)) {
+            if (IsOnScreen(targetCenter)) {
+                string tName = target.Name ?? "(unknown)";
+                string tDesc = route.TargetContent != null ? $"{tName} - {route.TargetContent}" : tName;
+                string tLabel = route.Steps >= 0 ? $"{prefix}{tDesc} ({route.Steps} steps)" : $"{prefix}{tDesc}";
+                // A target restored from the saved graph but not yet re-seen this session is drawn faint
+                // and tagged, since its completed/unlocked state may be out of date until reconfirmed.
+                bool unconfirmed = !target.SeenLive;
+                if (unconfirmed)
+                    tLabel += "  (unconfirmed)";
+                float radius = thalf * Settings.RingRadius + 10;
+                Color ringColor = unconfirmed ? Dimmed(color) : estTarget ? Faded(color, 185) : color;
+                Graphics.DrawCircle(targetCenter, radius, ringColor, Settings.RingWidth, 32);
+                DrawCenteredTextWithBackground(tLabel, targetCenter - new Vector2(0, radius + 12), Settings.FontColor, Settings.BackgroundColor, true, 10, 4);
+            }
         }
 
         // Arrow toward the next thing to reach (the first stop for a multi-stop route). Works for off-screen
         // targets too: a live rect if rendered, else an estimate from the fitted transform, else the nearest
         // on-screen node on the route.
         if (Settings.ShowArrow) {
-            if (!TryResolveScreenPos(target, route.Path, descByCoord, transform, out Vector2 tpos, out bool isLive))
+            if (!TryResolveScreenPos(target, route.Path, descByCoord, transform, out Vector2 tpos, out bool isLive, out bool viaFallback))
                 return;
-            if (!isLive && !Settings.ShowFarArrows)
+            // A target the game does not currently render still gets its arrow when the position is a
+            // projected coordinate (the transform is validity-gated, so the estimate is dependable - and
+            // after an instance reload it is the only indicator the route has left). ShowFarArrows now
+            // gates only the nearest-on-screen-path-node fallback, which points at the route rather than
+            // the target - the imprecise case it was turned off for.
+            if (viaFallback && !Settings.ShowFarArrows)
                 return;
 
             // On-screen targets only get an arrow once they are far enough from center to be worth one; an
@@ -2200,9 +2293,9 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 Vector2 direction = tpos - screenCenter;
                 float phi = (float)Math.Atan2(direction.Y, direction.X) + (float)(Math.PI / 2);
 
-                Color arrowColor = arrowUnconfirmed ? Color.FromArgb(150, color) : Color.FromArgb(255, color);
+                Color arrowColor = arrowUnconfirmed ? Color.FromArgb(150, color)
+                : isLive ? Color.FromArgb(255, color) : Color.FromArgb(195, color);
                 DrawRotatedImage(arrowId, arrowPosition, arrowSize, phi, arrowColor);
-
                 Vector2 textPosition = arrowPosition + new Vector2(arrowSize.X / 2, arrowSize.Y / 2);
                 textPosition = Vector2.Lerp(textPosition, screenCenter, 0.10f);
                 DrawCenteredTextWithBackground(arrowLabel, textPosition, arrowColor, Settings.BackgroundColor, true, 10, 4);
@@ -2210,35 +2303,103 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         }
     }
 
-    // A fitted affine map from atlas coordinates to screen pixels (screen = A*coord + b), recovered each
-    // frame from the nodes currently on screen. Lets the overlay estimate where an off-screen target sits so
-    // the arrow can point at maps you have not panned to. Valid only when the fit is trustworthy.
+    // Where to draw a remembered node: the center of its live element if the game currently renders one,
+    // else its atlas coordinate projected through the fitted transform (estimated=true). halfWidth sizes
+    // rings - half the live rect, or a fraction of the fitted pixels-per-coordinate-step when projected.
+    private bool TryNodeScreenPos(GraphNode n, Dictionary<Vector2i, AtlasNodeDescription> descByCoord, AtlasTransform transform, out Vector2 pos, out float halfWidth, out bool estimated)
+    {
+        pos = default;
+        halfWidth = 0f;
+        estimated = false;
+        if (n == null)
+            return false;
+
+        if (descByCoord.TryGetValue(n.Coord, out var d)) {
+            try {
+                var rect = d.Element.GetClientRect();
+                var center = rect.Center;
+                // A repopulating element can read a zeroed rect without throwing; treat that as not
+                // really live (mirroring the fit's sample filter) and fall through to the projection.
+                if (rect.Right > rect.Left && (center.X != 0 || center.Y != 0)) {
+                    pos = center;
+                    halfWidth = (rect.Right - rect.Left) / 2f;
+                    return true;
+                }
+            } catch { }
+        }
+
+        if (!transform.Valid || !transform.TryApply(n.Coord.X, n.Coord.Y, out pos))
+            return false;
+        float scale = transform.LocalScaleAt(n.Coord.X, n.Coord.Y);
+        halfWidth = Math.Clamp(scale * 0.28f, 6f, 40f);
+        estimated = true;
+        return true;
+    }
+
+    // A fitted projective map from atlas coordinates to screen pixels, recovered from the nodes near the
+    // screen. The atlas plane renders with a perspective tilt, so an affine model leaves residuals of
+    // hundreds of pixels across a single viewport even with clean screen-local samples - a homography
+    // models the tilt exactly. Valid only when the fit is trustworthy; TryApply refuses points at or
+    // beyond the fitted horizon, where a projective extrapolation stops meaning anything.
     private struct AtlasTransform
     {
         public bool Valid;
-        public float Axx, Axy, Bx;
-        public float Ayx, Ayy, By;
-        public readonly Vector2 Apply(Vector2i c) => new(Axx * c.X + Axy * c.Y + Bx, Ayx * c.X + Ayy * c.Y + By);
+        public double H00, H01, H02;
+        public double H10, H11, H12;
+        public double H20, H21, H22;
+
+        public readonly bool TryApply(double x, double y, out Vector2 pos)
+        {
+            pos = default;
+            double w = H20 * x + H21 * y + H22;
+            if (w < 1e-6)
+                return false;
+            double sx = (H00 * x + H01 * y + H02) / w;
+            double sy = (H10 * x + H11 * y + H12) / w;
+            if (Math.Abs(sx) > 1e5 || Math.Abs(sy) > 1e5)
+                return false;
+            pos = new Vector2((float)sx, (float)sy);
+            return true;
+        }
+
+        // How many pixels one coordinate step moves on screen around (x,y) - under a projective map the
+        // scale varies with position, so it is probed locally instead of read off matrix columns.
+        public readonly float LocalScaleAt(double x, double y)
+        {
+            if (!TryApply(x, y, out var p0) || !TryApply(x + 1, y, out var px) || !TryApply(x, y + 1, out var py))
+                return 0f;
+            return Math.Max(Vector2.Distance(p0, px), Vector2.Distance(p0, py));
+        }
     }
 
     // Where to draw/point for a node: its live on-screen center if the game currently renders it, else an
-    // estimate from the fitted transform, else the nearest on-screen node along the route. False if none.
-    private bool TryResolveScreenPos(GraphNode node, List<GraphNode> path, Dictionary<Vector2i, AtlasNodeDescription> descByCoord, AtlasTransform transform, out Vector2 pos, out bool isLive)
+    // estimate from the fitted transform, else the nearest on-screen node along the route (viaFallback) -
+    // reported explicitly because a Valid transform can still refuse a point beyond its fitted horizon.
+    private bool TryResolveScreenPos(GraphNode node, List<GraphNode> path, Dictionary<Vector2i, AtlasNodeDescription> descByCoord, AtlasTransform transform, out Vector2 pos, out bool isLive, out bool viaFallback)
     {
         pos = default;
         isLive = false;
+        viaFallback = false;
         if (node == null)
             return false;
 
         if (descByCoord.TryGetValue(node.Coord, out var d)) {
-            try { pos = d.Element.GetClientRect().Center; isLive = true; return true; }
-            catch { }
+            try {
+                var rect = d.Element.GetClientRect();
+                var center = rect.Center;
+                // Same zeroed-rect guard as TryNodeScreenPos: a repopulating element reads (0,0)
+                // without throwing, which would otherwise pass for a live target at the screen origin
+                // and point the arrow into the corner.
+                if (rect.Right > rect.Left && (center.X != 0 || center.Y != 0)) {
+                    pos = center;
+                    isLive = true;
+                    return true;
+                }
+            } catch { }
         }
 
-        if (transform.Valid) {
-            pos = transform.Apply(node.Coord);
+        if (transform.Valid && transform.TryApply(node.Coord.X, node.Coord.Y, out pos))
             return true;
-        }
 
         if (path != null) {
             for (int i = path.Count - 1; i >= 0; i--) {
@@ -2246,34 +2407,108 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 if (pn == null || !descByCoord.TryGetValue(pn.Coord, out var pd))
                     continue;
                 try {
-                    var c = pd.Element.GetClientRect().Center;
-                    if (IsOnScreen(c)) { pos = c; return true; }
+                    var rect = pd.Element.GetClientRect();
+                    var c = rect.Center;
+                    if (rect.Right <= rect.Left || (c.X == 0 && c.Y == 0))
+                        continue;
+                    if (IsOnScreen(c)) { pos = c; viaFallback = true; return true; }
                 } catch { }
             }
         }
         return false;
     }
 
-    // Least-squares fit of coord->screen from the on-screen nodes, using MEAN-CENTERED coordinates: this is
-    // far better conditioned than the raw normal equations and turns the singularity test into a meaningful
-    // relative one. Rejected when the visible nodes span too few distinct rows/columns (near-collinear, so an
-    // off-screen estimate would be unreliable) or when the in-sample residual is large vs the per-coord scale.
-    // Side of the square coordinate grid the fit samples from: FitGridDim^2 is the hard cap on how many
-    // GetClientRect reads the fit costs, no matter how many nodes are on screen.
+    // Least-squares fit of coord->screen from the nodes near the screen, using MEAN-CENTERED coordinates:
+    // this is far better conditioned than the raw normal equations and turns the singularity test into a
+    // meaningful relative one. Rejected when the usable nodes span too few distinct rows/columns
+    // (near-collinear, so an off-screen estimate would be unreliable) or when the in-sample residual is
+    // large vs the per-coord scale.
+    // Side of the square coordinate grid each sampling pass uses: 3*FitGridDim^2 is the hard cap on how
+    // many GetClientRect reads one fit costs, no matter how many nodes the panel holds.
     private const int FitGridDim = 8;
+
+    // Refitting costs up to 3*FitGridDim^2 rect reads, so a full solve runs at most this often;
+    // between solves the held fit is pan-followed per frame at the cost of a single rect read.
+    private const double FitReuseSeconds = 0.25;
+    private DateTime fitCacheAt = DateTime.MinValue;
+
+    // Hysteresis on the validity gate. The in-sample rms wanders around the gate second to second
+    // even at a static camera (the sample mix shifts as elements repopulate), and blanking the
+    // overlay on every crossing reads as flicker. The last gate-passing fit is therefore held and
+    // drawn through rejections that are merely marginal; only a run of hard rejections - real
+    // garbage measures an order of magnitude past the gate, not a few percent - or closing the
+    // atlas drops it.
+    private const double MarginalRejectFactor = 1.5;
+    private const int HardRejectsToBlank = 3;
+    private AtlasTransform heldFit;
+    private bool heldFitSet;
+    private int hardRejectStreak;
+    // Set by FitAtlasTransform when its rejection was marginal (solved, but rms a hair past the gate).
+    private bool fitRejectedMarginally;
+
+    // Pan-follow anchor: one sample of the held fit whose live rect is re-read every frame; its
+    // screen delta since the solve is pre-composed onto the homography as a translation, which is
+    // exact under a pure pan. Estimated pieces then track the camera per frame instead of stepping
+    // at the refit cadence; zoom and rotation are still corrected by the next full solve.
+    private Vector2i heldAnchorCoord;
+    private Vector2 heldAnchorScreen;
+    // Anchor candidate from the latest solve, promoted to heldAnchor* when the fit passes the gate.
+    private Vector2i fitAnchorCoord;
+    private Vector2 fitAnchorScreen;
+
+    // Re-read the held fit's anchor element and shift the homography by the anchor's screen delta
+    // since the solve: H' = T(d)*H, i.e. d*row2 added onto rows 0/1. Falls back to the unshifted
+    // fit when the anchor no longer resolves (panned out of the element set, or its rect went
+    // stale); anchored reports whether the delta was applied, i.e. whether the returned fit is
+    // confirmed to match the current camera.
+    private AtlasTransform PanFollow(AtlasTransform t, Dictionary<Vector2i, AtlasNodeDescription> descByCoord, out bool anchored)
+    {
+        anchored = false;
+        if (!descByCoord.TryGetValue(heldAnchorCoord, out var d))
+            return t;
+        Vector2 c;
+        try {
+            var rc = d.Element.GetClientRect();
+            c = rc.Center;
+            if (rc.Right <= rc.Left || (c.X == 0 && c.Y == 0))
+                return t;
+        } catch {
+            return t;
+        }
+        double dx = c.X - heldAnchorScreen.X, dy = c.Y - heldAnchorScreen.Y;
+        // A jump past a full screen diagonal is not a pan: rects far from the camera sit off the
+        // viewport's projective plane, so a huge delta means the anchor's rect has degraded, not
+        // that the camera moved that far between solves.
+        if (dx * dx + dy * dy > (double)cachedScreenRect.Width * cachedScreenRect.Width
+                              + (double)cachedScreenRect.Height * cachedScreenRect.Height)
+            return t;
+        anchored = true;
+        if (dx == 0 && dy == 0)
+            return t;
+        t.H00 += dx * t.H20; t.H01 += dx * t.H21; t.H02 += dx * t.H22;
+        t.H10 += dy * t.H20; t.H11 += dy * t.H21; t.H12 += dy * t.H22;
+        return t;
+    }
 
     private AtlasTransform FitAtlasTransform(Dictionary<Vector2i, AtlasNodeDescription> descByCoord)
     {
         var t = new AtlasTransform { Valid = false };
-        if (descByCoord.Count < 8)
+        fitRejectedMarginally = false;
+        if (descByCoord.Count < 10)
             return t;
 
-        // Bound the cost: an affine fit needs only a few dozen well-spread points, and each GetClientRect is
-        // a per-call game-memory read (parent-chain walk) - so reading one for every visible node every frame
-        // was the perf regression. Bucket nodes by atlas coordinate (a cheap integer read, no rect) into a
-        // coarse grid and read the screen rect of just one node per bucket. This caps the reads at
-        // FitGridDim^2 and keeps the samples spatially spread (the first N in hash order could be a
-        // near-collinear cluster that fails the conditioning test below).
+        // Descriptions spans the whole discovered atlas, and elements far from the camera read rect
+        // centers tens of thousands of pixels out - positions that do not sit on the same projective
+        // plane as the viewport, so feeding them to the fit drives the residual into the thousands of
+        // pixels and it never passes its gate. Only anchors near the screen are trustworthy, so the
+        // fit samples in up to three passes: a coarse coordinate-grid probe over the full span to find
+        // which window of coordinate space is actually on screen, a dense re-bucket of just that
+        // window, and - if that still starves the fit - one more bucket tight around the on-screen
+        // hits. Each pass reads at most one rect per grid cell (a GetClientRect is a per-call
+        // game-memory read - the reason the fit never simply reads every node).
+        var screenZone = cachedScreenRect;
+        screenZone.Inflate(screenZone.Width * 0.35f, screenZone.Height * 0.35f);
+
         int minX = int.MaxValue, minY = int.MaxValue, maxX = int.MinValue, maxY = int.MinValue;
         foreach (var c in descByCoord.Keys) {
             if (c.X < minX) minX = c.X;
@@ -2283,61 +2518,282 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         }
         long spanX = Math.Max(1, maxX - minX), spanY = Math.Max(1, maxY - minY);
 
-        var picks = new Dictionary<int, (Vector2i coord, AtlasNodeDescription desc)>(FitGridDim * FitGridDim);
-        foreach (var kv in descByCoord) {
-            int gx = (int)((kv.Key.X - minX) * (FitGridDim - 1) / spanX);
-            int gy = (int)((kv.Key.Y - minY) * (FitGridDim - 1) / spanY);
-            picks.TryAdd(gy * FitGridDim + gx, (kv.Key, kv.Value));
+        var probedCoords = new HashSet<Vector2i>();
+        var samples = new List<(double cx, double cy, double sx, double sy)>(FitGridDim * FitGridDim);
+        int sMinX = int.MaxValue, sMinY = int.MaxValue, sMaxX = int.MinValue, sMaxY = int.MinValue;
+        Vector2i nearestCoord = default;
+        float nearestDist = float.MaxValue;
+        Vector2 screenMid = new(cachedScreenRect.Width / 2f, cachedScreenRect.Height / 2f);
+
+        void Probe(Vector2i coord, AtlasNodeDescription desc)
+        {
+            if (!probedCoords.Add(coord))
+                return;
+            Vector2 c;
+            try {
+                var rc = desc.Element.GetClientRect();
+                c = rc.Center;
+                if (rc.Right <= rc.Left || (c.X == 0 && c.Y == 0))
+                    return;
+            } catch {
+                return;
+            }
+            float dist = Vector2.Distance(c, screenMid);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearestCoord = coord;
+            }
+            if (!screenZone.Contains(c))
+                return;
+            samples.Add((coord.X, coord.Y, c.X, c.Y));
+            if (coord.X < sMinX) sMinX = coord.X;
+            if (coord.X > sMaxX) sMaxX = coord.X;
+            if (coord.Y < sMinY) sMinY = coord.Y;
+            if (coord.Y > sMaxY) sMaxY = coord.Y;
         }
 
-        var samples = new List<(double cx, double cy, double sx, double sy)>(picks.Count);
-        foreach (var p in picks.Values) {
-            Vector2 c;
-            try { c = p.desc.Element.GetClientRect().Center; }
-            catch { continue; }
-            if (c.X == 0 && c.Y == 0)
-                continue;
-            samples.Add((p.coord.X, p.coord.Y, c.X, c.Y));
+        void BucketProbe(long bMinX, long bMaxX, long bMinY, long bMaxY)
+        {
+            long bSpanX = Math.Max(1, bMaxX - bMinX), bSpanY = Math.Max(1, bMaxY - bMinY);
+            var bucket = new Dictionary<int, (Vector2i coord, AtlasNodeDescription desc)>(FitGridDim * FitGridDim);
+            foreach (var kv in descByCoord) {
+                if (kv.Key.X < bMinX || kv.Key.X > bMaxX || kv.Key.Y < bMinY || kv.Key.Y > bMaxY)
+                    continue;
+                if (probedCoords.Contains(kv.Key))
+                    continue;
+                int gx = (int)((kv.Key.X - bMinX) * FitGridDim / (bSpanX + 1));
+                int gy = (int)((kv.Key.Y - bMinY) * FitGridDim / (bSpanY + 1));
+                bucket.TryAdd(gy * FitGridDim + gx, (kv.Key, kv.Value));
+            }
+            foreach (var p in bucket.Values)
+                Probe(p.coord, p.desc);
         }
-        if (samples.Count < 8)
+
+        BucketProbe(minX, maxX, minY, maxY);
+
+        // Window for the dense pass: the coordinate bbox of the pass-1 on-screen hits, padded by one
+        // coarse cell so the screen edges are covered. If pass 1 found nothing on screen (its picks are
+        // one arbitrary node per huge cell), seed the window from the probe that landed closest to the
+        // screen center instead - it is almost always inside or beside the viewport.
+        long cellX = Math.Max(1, spanX / FitGridDim), cellY = Math.Max(1, spanY / FitGridDim);
+        long wMinX, wMaxX, wMinY, wMaxY;
+        if (samples.Count > 0) {
+            wMinX = sMinX - cellX; wMaxX = sMaxX + cellX;
+            wMinY = sMinY - cellY; wMaxY = sMaxY + cellY;
+        } else if (nearestDist < float.MaxValue) {
+            wMinX = nearestCoord.X - 2 * cellX; wMaxX = nearestCoord.X + 2 * cellX;
+            wMinY = nearestCoord.Y - 2 * cellY; wMaxY = nearestCoord.Y + 2 * cellY;
+        } else {
+            return t;
+        }
+
+        BucketProbe(wMinX, wMaxX, wMinY, wMaxY);
+
+        // Both windows above are sized in atlas-span cells, which can dwarf the viewport when zoomed
+        // far in - the dense pass then spreads its buckets mostly outside the screen and starves the
+        // fit. When that happens, re-bucket once more around the on-screen hits themselves: by now
+        // their bbox is viewport-tight, so this final grid is dense exactly where it matters.
+        if (samples.Count > 0 && samples.Count < 10) {
+            long padX = Math.Max(4, sMaxX - sMinX), padY = Math.Max(4, sMaxY - sMinY);
+            BucketProbe(sMinX - padX, sMaxX + padX, sMinY - padY, sMaxY + padY);
+        }
+
+        if (samples.Count < 10)
             return t;
 
+        // Self-contained solve over one sample set: conditioning guards, Hartley normalization, the
+        // inhomogeneous DLT (H22 pinned to 1 in normalized space), denormalization and the horizon
+        // check, plus per-sample residuals so the caller can trim outliers and re-solve. The atlas
+        // plane is drawn in perspective, so screen = H*coord for a projective H; an affine fit
+        // leaves the tilt itself as residual. Each sample contributes
+        //   [X Y 1 0 0 0 -uX -uY] p = u   and   [0 0 0 X Y 1 -vX -vY] p = v.
+        bool Solve(List<(double cx, double cy, double sx, double sy)> set,
+            out AtlasTransform fit, out double[] resid, out double rms)
+        {
+            fit = new AtlasTransform { Valid = false };
+            resid = null;
+            rms = 0;
+            int m = set.Count;
+            double mcx = 0, mcy = 0, msx = 0, msy = 0;
+            foreach (var s in set) { mcx += s.cx; mcy += s.cy; msx += s.sx; msy += s.sy; }
+            mcx /= m; mcy /= m; msx /= m; msy /= m;
+
+            // Conditioning guard on the coordinate spread, kept from the affine version: one screen
+            // row/column of nodes cannot anchor a 2D map.
+            double Sxx = 0, Sxy = 0, Syy = 0;
+            foreach (var s in set) {
+                double dx = s.cx - mcx, dy = s.cy - mcy;
+                Sxx += dx * dx; Sxy += dx * dy; Syy += dy * dy;
+            }
+            double det2 = Sxx * Syy - Sxy * Sxy;
+            if (Sxx <= 0 || Syy <= 0 || det2 <= 1e-3 * Sxx * Syy)
+                return false;   // near-collinear visible nodes - extrapolating off-screen would be unreliable
+
+            double dc = 0, dsp = 0;
+            foreach (var s in set) {
+                dc += Math.Sqrt((s.cx - mcx) * (s.cx - mcx) + (s.cy - mcy) * (s.cy - mcy));
+                dsp += Math.Sqrt((s.sx - msx) * (s.sx - msx) + (s.sy - msy) * (s.sy - msy));
+            }
+            dc /= m; dsp /= m;
+            if (dc < 1e-9 || dsp < 1e-9)
+                return false;   // degenerate point spread
+            double kc = Math.Sqrt(2) / dc, ks = Math.Sqrt(2) / dsp;
+
+            var M = new double[8, 9];   // normal equations, column 8 = right-hand side
+            var row = new double[8];
+            void Accumulate(double target)
+            {
+                for (int i = 0; i < 8; i++) {
+                    if (row[i] == 0)
+                        continue;
+                    for (int j = i; j < 8; j++)
+                        M[i, j] += row[i] * row[j];
+                    M[i, 8] += row[i] * target;
+                }
+            }
+            foreach (var s in set) {
+                double X = (s.cx - mcx) * kc, Y = (s.cy - mcy) * kc;
+                double u = (s.sx - msx) * ks, v = (s.sy - msy) * ks;
+                row[0] = X; row[1] = Y; row[2] = 1; row[3] = 0; row[4] = 0; row[5] = 0; row[6] = -u * X; row[7] = -u * Y;
+                Accumulate(u);
+                row[0] = 0; row[1] = 0; row[2] = 0; row[3] = X; row[4] = Y; row[5] = 1; row[6] = -v * X; row[7] = -v * Y;
+                Accumulate(v);
+            }
+            for (int i = 1; i < 8; i++)
+                for (int j = 0; j < i; j++)
+                    M[i, j] = M[j, i];
+
+            for (int col = 0; col < 8; col++) {
+                int piv = col;
+                for (int r = col + 1; r < 8; r++)
+                    if (Math.Abs(M[r, col]) > Math.Abs(M[piv, col]))
+                        piv = r;
+                if (Math.Abs(M[piv, col]) < 1e-12)
+                    return false;   // singular system
+                if (piv != col)
+                    for (int j = col; j < 9; j++)
+                        (M[col, j], M[piv, j]) = (M[piv, j], M[col, j]);
+                for (int r = col + 1; r < 8; r++) {
+                    double f = M[r, col] / M[col, col];
+                    for (int j = col; j < 9; j++)
+                        M[r, j] -= f * M[col, j];
+                }
+            }
+            var p = new double[8];
+            for (int r = 7; r >= 0; r--) {
+                double acc = M[r, 8];
+                for (int j = r + 1; j < 8; j++)
+                    acc -= M[r, j] * p[j];
+                p[r] = acc / M[r, r];
+            }
+
+            // Denormalize: H = Tscreen^-1 * Hn * Tcoord, then orient so w is positive over the window.
+            double[,] Mul3(double[,] A, double[,] B)
+            {
+                var R = new double[3, 3];
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++)
+                        R[i, j] = A[i, 0] * B[0, j] + A[i, 1] * B[1, j] + A[i, 2] * B[2, j];
+                return R;
+            }
+            double[,] Hn = { { p[0], p[1], p[2] }, { p[3], p[4], p[5] }, { p[6], p[7], 1 } };
+            double[,] Tc = { { kc, 0, -kc * mcx }, { 0, kc, -kc * mcy }, { 0, 0, 1 } };
+            double[,] Tsi = { { 1 / ks, 0, msx }, { 0, 1 / ks, msy }, { 0, 0, 1 } };
+            var H = Mul3(Tsi, Mul3(Hn, Tc));
+            if (H[2, 0] * mcx + H[2, 1] * mcy + H[2, 2] < 0)
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++)
+                        H[i, j] = -H[i, j];
+
+            fit.H00 = H[0, 0]; fit.H01 = H[0, 1]; fit.H02 = H[0, 2];
+            fit.H10 = H[1, 0]; fit.H11 = H[1, 1]; fit.H12 = H[1, 2];
+            fit.H20 = H[2, 0]; fit.H21 = H[2, 1]; fit.H22 = H[2, 2];
+
+            // Every sample must sit well on the near side of the fitted horizon: a fit that bends the
+            // horizon through the sample window would extrapolate garbage even with tiny in-sample
+            // residuals. Depth is measured relative to the window centroid so the test is scale-free.
+            double wc = fit.H20 * mcx + fit.H21 * mcy + fit.H22;
+            if (wc <= 0)
+                return false;   // degenerate orientation
+            resid = new double[m];
+            double sse = 0;
+            for (int i = 0; i < m; i++) {
+                var s = set[i];
+                double w = fit.H20 * s.cx + fit.H21 * s.cy + fit.H22;
+                if (w < 0.15 * wc)
+                    return false;   // fitted horizon crosses the sample window
+                double ex = (fit.H00 * s.cx + fit.H01 * s.cy + fit.H02) / w - s.sx;
+                double ey = (fit.H10 * s.cx + fit.H11 * s.cy + fit.H12) / w - s.sy;
+                resid[i] = Math.Sqrt(ex * ex + ey * ey);
+                sse += ex * ex + ey * ey;
+            }
+            rms = Math.Sqrt(sse / m);
+            return true;
+        }
+
         int n = samples.Count;
-        double mcx = 0, mcy = 0, msx = 0, msy = 0;
-        foreach (var s in samples) { mcx += s.cx; mcy += s.cy; msx += s.sx; msy += s.sy; }
-        mcx /= n; mcy /= n; msx /= n; msy /= n;
+        if (!Solve(samples, out t, out var resid, out var rms))
+            return t;
 
-        double Sxx = 0, Sxy = 0, Syy = 0, rX0 = 0, rX1 = 0, rY0 = 0, rY1 = 0;
-        foreach (var s in samples) {
-            double dx = s.cx - mcx, dy = s.cy - mcy, ex = s.sx - msx, ey = s.sy - msy;
-            Sxx += dx * dx; Sxy += dx * dy; Syy += dy * dy;
-            rX0 += dx * ex; rX1 += dy * ex;
-            rY0 += dx * ey; rY1 += dy * ey;
+        // A handful of nodes sit far off the lattice (field dumps: individual residuals up to ~110px
+        // against a ~25px rms), and they alone can push a marginal sample mix past the gate. One
+        // trimmed re-solve drops the worst offenders; the cap keeps a genuinely bad fit from trimming
+        // itself respectable, and the sample floor keeps the re-solve as constrained as the first.
+        var kept = samples;
+        int trimCap = Math.Min(n / 5, n - 10);
+        if (trimCap > 0) {
+            double cut = 2.5 * rms;
+            var dropIdx = new List<int>();
+            for (int i = 0; i < n; i++)
+                if (resid[i] > cut)
+                    dropIdx.Add(i);
+            if (dropIdx.Count > trimCap) {
+                dropIdx.Sort((a, b) => resid[b].CompareTo(resid[a]));
+                dropIdx.RemoveRange(trimCap, dropIdx.Count - trimCap);
+            }
+            if (dropIdx.Count > 0) {
+                var drop = new HashSet<int>(dropIdx);
+                var trimmedSet = new List<(double cx, double cy, double sx, double sy)>(n - dropIdx.Count);
+                for (int i = 0; i < n; i++)
+                    if (!drop.Contains(i))
+                        trimmedSet.Add(samples[i]);
+                if (Solve(trimmedSet, out var refit, out _, out double rmsTrimmed)) {
+                    t = refit;
+                    rms = rmsTrimmed;
+                    kept = trimmedSet;
+                }
+            }
         }
 
-        double det2 = Sxx * Syy - Sxy * Sxy;
-        if (Sxx <= 0 || Syy <= 0 || det2 <= 1e-3 * Sxx * Syy)
-            return t;   // near-collinear visible nodes - extrapolating off-screen would be unreliable
+        double cmx = 0, cmy = 0;
+        foreach (var s in kept) { cmx += s.cx; cmy += s.cy; }
+        cmx /= kept.Count; cmy /= kept.Count;
 
-        double ax = (rX0 * Syy - rX1 * Sxy) / det2;
-        double bx = (Sxx * rX1 - Sxy * rX0) / det2;
-        double ay = (rY0 * Syy - rY1 * Sxy) / det2;
-        double by = (Sxx * rY1 - Sxy * rY0) / det2;
-        double cx0 = msx - ax * mcx - bx * mcy;
-        double cy0 = msy - ay * mcx - by * mcy;
+        double scale = t.LocalScaleAt(cmx, cmy);
+        // Gate calibrated from field sample dumps: atlas nodes sit organically off their lattice
+        // points, so a clean homography fit carries an irreducible 2D rms of ~0.5*scale (measured
+        // 0.49-0.53 across dumps, with zero quadrant bias - pure per-node jitter, not model error).
+        // 0.7 passes that with margin; the failure modes stay far away (reopen-transient frames with
+        // mixed stale/fresh rects measured ~18*scale, affine-grade error 3.9-4.6*scale).
+        double gate = Math.Max(12, 0.7 * scale);
+        t.Valid = scale > 1 && rms < gate;
+        fitRejectedMarginally = !t.Valid && scale > 1 && rms < MarginalRejectFactor * gate;
 
-        t.Axx = (float)ax; t.Axy = (float)bx; t.Bx = (float)cx0;
-        t.Ayx = (float)ay; t.Ayy = (float)by; t.By = (float)cy0;
-
-        double sse = 0;
-        foreach (var s in samples) {
-            double exr = ax * s.cx + bx * s.cy + cx0 - s.sx;
-            double eyr = ay * s.cx + by * s.cy + cy0 - s.sy;
-            sse += exr * exr + eyr * eyr;
+        if (t.Valid) {
+            // Anchor for the per-frame pan-follow: the kept sample nearest the screen center, where
+            // zoom/rotation drift since the solve leaks least into the composed translation.
+            double bestDist = double.MaxValue;
+            foreach (var s in kept) {
+                double dxm = s.sx - screenMid.X, dym = s.sy - screenMid.Y;
+                double dd = dxm * dxm + dym * dym;
+                if (dd < bestDist) {
+                    bestDist = dd;
+                    fitAnchorCoord = new Vector2i((int)s.cx, (int)s.cy);
+                    fitAnchorScreen = new Vector2((float)s.sx, (float)s.sy);
+                }
+            }
         }
-        double rms = Math.Sqrt(sse / n);
-        double scale = Math.Max(Math.Sqrt(ax * ax + ay * ay), Math.Sqrt(bx * bx + by * by));   // px per coord step
-        t.Valid = scale > 1 && rms < 0.75 * scale;
+
         return t;
     }
 
@@ -2464,9 +2920,12 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             } else {
                 string age = cacheRememberedAge;
                 ImGui.TextDisabled(age != null ? $"{cachedNodeCount} maps cached - remembered {age}" : $"{cachedNodeCount} maps cached");
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Maps remembered from everywhere you have panned over, saved to disk per character so they survive a game restart or plugin reload. Maps you completed while the atlas was closed may show faint and 'unconfirmed' until you pan over them again.");
+                string ev = lastCacheEvent;
+                if (ev != null)
+                    ImGui.TextDisabled(ev);
             }
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Maps remembered from everywhere you have panned over, saved to disk per character so they survive a game restart or plugin reload. Maps you completed while the atlas was closed may show faint and 'unconfirmed' until you pan over them again.");
             if (ImGui.Button("Rescan", new Vector2(-1, 0))) {
                 finderClearCacheRequested = true;
                 persistForgetRequested = true;
@@ -3069,6 +3528,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     // A faint version of a route color, used to draw targets restored from the saved graph but not yet
     // reconfirmed live this session.
     private static Color Dimmed(Color c) => Color.FromArgb(110, c.R, c.G, c.B);
+
+    // Caps a color's alpha, fading route pieces anchored to a projected coordinate rather than a live
+    // element. Capping (not replacing) keeps an already-translucent user color below its live opacity.
+    private static Color Faded(Color c, int alpha) => Color.FromArgb(Math.Min((int)c.A, alpha), c.R, c.G, c.B);
 
     #endregion
 }
