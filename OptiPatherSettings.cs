@@ -65,6 +65,26 @@ public class OptiPatherSettings : ISettings
     [Menu("Max Routes On Screen", "Soft cap on how many active searches draw their route/ring/arrow at once, to limit clutter.")]
     public RangeNode<int> MaxRoutesOnScreen { get; set; } = new RangeNode<int>(4, 1, 12);
 
+    [Menu("Show Atlas Minimap", "Overview of every remembered map while the atlas is open, with the region the camera currently sees and a marker per active search. Drag it to move it; lock it to let clicks pass through.")]
+    public ToggleNode ShowMinimap { get; set; } = new ToggleNode(true);
+
+    [ConditionalDisplay(nameof(ShowMinimap), true)]
+    [Menu("Minimap Width", "Width of the minimap in pixels; the height follows the shape of the remembered atlas.")]
+    public RangeNode<int> MinimapSize { get; set; } = new RangeNode<int>(280, 150, 500);
+
+    [ConditionalDisplay(nameof(ShowMinimap), true)]
+    [Menu("Minimap Opacity", "Background opacity of the minimap.")]
+    public RangeNode<float> MinimapOpacity { get; set; } = new RangeNode<float>(0.85f, 0.2f, 1f);
+
+    [ConditionalDisplay(nameof(ShowMinimap), true)]
+    [Menu("Lock Minimap", "Fix the minimap in place and let the mouse click through it.")]
+    public ToggleNode MinimapLocked { get; set; } = new ToggleNode(false);
+
+    // Last dragged minimap position, remembered across sessions; negative means not placed yet
+    // (it then defaults to the top-right corner).
+    public float MinimapPosX { get; set; } = -1f;
+    public float MinimapPosY { get; set; } = -1f;
+
     // Saved searches, edited through the Map Finder panel. Initialised empty on purpose: the settings
     // serializer appends to an existing list rather than replacing it, so a seeded default would
     // duplicate itself on every launch.

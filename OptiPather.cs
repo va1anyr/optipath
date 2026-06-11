@@ -30,7 +30,7 @@ namespace OptiPather;
 // loop only resolves live node positions for drawing.
 public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 {
-    public const string Version = "2.2.6";
+    public const string Version = "2.3.8";
 
     // On-disk graph format version. Bump on any schema change to NodeDto/EdgeDto/GraphSnapshot;
     // a file written by a different version is discarded and rebuilt by re-panning the atlas.
@@ -387,9 +387,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
         screenCenter = GameController.Window.GetWindowRectangle().Center - GameController.Window.GetWindowRectangle().Location;
 
-        // Refresh every couple of seconds while a search is active (so step counts track progress) or
-        // while the panel is open (so the content dropdown stays populated as the atlas reveals more).
-        bool active = AnyActivePreset() || MapFinderPanelIsOpen;
+        // Refresh every couple of seconds while a search is active (so step counts track progress),
+        // while the panel is open (so the content dropdown stays populated as the atlas reveals
+        // more), or while the minimap is on - its overview is fed by these same scans.
+        bool active = AnyActivePreset() || MapFinderPanelIsOpen || Settings.ShowMinimap;
         if (active && !finderBusy && DateTime.Now.Subtract(lastFinderRecompute).TotalSeconds > 2)
             mapFinderDirty = true;
 
@@ -462,8 +463,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
         UpdateScreenBounds();
 
-        try { DrawMapFinderRoutes(); }
-        catch (Exception e) { LogError("Error drawing map finder routes: " + e.Message + "\n" + e.StackTrace); }
+        try { DrawAtlasOverlays(); }
+        catch (Exception e) { LogError("Error drawing atlas overlays: " + e.Message + "\n" + e.StackTrace); }
     }
 
     private void CheckKeybinds()
@@ -614,6 +615,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             cachedNodes.Clear();
             cachedAdjacency.Clear();
             cachedNodeCount = 0;
+            minimapSnapshot = null;
             persistDirty = false;
             swapSignalStreak = 0;
             if (persistOn && forget && loadedIdentityKey != null)
@@ -759,6 +761,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             cachedNodes.Clear();
             cachedAdjacency.Clear();
             cachedNodeCount = 0;
+            minimapSnapshot = null;
             persistDirty = false;
             // The live atlas persistently disagrees with the remembered graph (a relayout, or a different
             // character reusing this name+league); forget the file so it can't reload the bad data.
@@ -800,6 +803,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         foreach (var gn in freshThisScan)
             cachedNodes[gn.Coord] = gn;
         cachedNodeCount = cachedNodes.Count;
+        PublishMinimapSnapshot();
         if (changed)
             persistDirty = true;
 
@@ -1820,6 +1824,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         cacheRememberedAge = age;
         loadedIdentityKey = currentKey;
         cachedNodeCount = cachedNodes.Count;
+        PublishMinimapSnapshot();
         lastPersistSave = DateTime.Now;   // freshly in sync with disk - don't immediately re-save
         lastCacheEvent = cachedNodes.Count > 0
             ? $"restored {cachedNodes.Count} maps from disk" + (age != null ? $" ({age})" : "")
@@ -2030,28 +2035,83 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
     #region Rendering
 
-    private void DrawMapFinderRoutes()
+    // Everything drawn over the open atlas: the route overlay and the minimap. Both need the same
+    // groundwork - the live element index and the fitted coord->screen transform - so it is resolved
+    // once per frame here and handed to each.
+    private void DrawAtlasOverlays()
     {
-        if (!Settings.ShowOnAtlas)
+        var snap = minimapSnapshot;
+        bool minimapOn = Settings.ShowMinimap && snap is { Nodes.Count: > 0 };
+        if (!Settings.ShowOnAtlas && !minimapOn)
             return;
 
+        // Built even when the atlas overlay is toggled off, so the minimap markers stay in sync with
+        // the active searches either way.
+        var drawList = BuildRouteDrawList();
+        bool routesOn = Settings.ShowOnAtlas && drawList.Count > 0;
+        if (!routesOn && !minimapOn)
+            return;
+
+        // Resolve current screen rects by coordinate once; the search ran against a copy, positions are live.
+        Dictionary<Vector2i, AtlasNodeDescription> descByCoord = null;
+        try {
+            var descs = AtlasPanel.Descriptions;
+            descByCoord = new Dictionary<Vector2i, AtlasNodeDescription>(descs.Count);
+            foreach (var d in descs)
+                descByCoord[d.Coordinate] = d;
+        } catch {
+            // Unreadable this frame - routes need live anchors so they sit this one out; the minimap
+            // still draws its remembered dots, just without the viewport box. A throw mid-population
+            // discards the partial index, which would otherwise misread live nodes as missing.
+            descByCoord = null;
+        }
+
+        AtlasTransform transform = default;   // Valid == false
+        if (descByCoord != null) {
+            // Routes want the fit when any drawn piece lacks a live anchor; the minimap wants it
+            // for its viewport box. In the common case everything is live, the minimap is off and
+            // the fit is skipped entirely.
+            bool needFit = routesOn && RoutesNeedFit(drawList, descByCoord);
+            transform = ResolveAtlasTransform(descByCoord, needFit || minimapOn);
+        }
+
+        if (routesOn && descByCoord != null) {
+            bool labelWithName = drawList.Count > 1;
+            foreach (var route in drawList) {
+                try {
+                    DrawSingleRoute(route, descByCoord, transform, labelWithName);
+                } catch (Exception e) {
+                    LogError($"Error drawing route '{route.PresetName}': {e.Message}\n{e.StackTrace}");
+                }
+            }
+        }
+
+        if (minimapOn) {
+            try {
+                DrawMinimap(snap, drawList, transform);
+            } catch (Exception e) {
+                LogError("Error drawing minimap: " + e.Message + "\n" + e.StackTrace);
+            }
+        }
+    }
+
+    // The routes allowed on screen this frame: one per checked (active) search with an unvisited
+    // target, nearest-first, soft-capped. The selected-but-unchecked search still shows its results in
+    // the panel, but ticking the checkbox is the single control over what appears on the map.
+    private List<FinderResult> BuildRouteDrawList()
+    {
+        var drawList = new List<FinderResult>();
         var results = mapFinderResults;
         if (results == null || results.Count == 0)
-            return;
+            return drawList;
 
         var presets = Settings.Presets;
-
-        // Only checked (active) searches draw on the atlas. The selected-but-unchecked search still shows its
-        // results in the panel, but ticking the checkbox is the single control over what appears on the map.
-        var drawList = new List<FinderResult>();
         foreach (var r in results) {
             if (r?.Target == null || r.Target.Visited)
                 continue;
             if (presets != null && r.PresetIndex >= 0 && r.PresetIndex < presets.Count && presets[r.PresetIndex].Active)
                 drawList.Add(r);
         }
-        if (drawList.Count == 0)
-            return;
 
         // Soft cap, keeping the edited search and then the nearest targets.
         drawList.Sort((a, b) => {
@@ -2064,46 +2124,48 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         int cap = Math.Max(1, Settings.MaxRoutesOnScreen.Value);
         if (drawList.Count > cap)
             drawList = drawList.GetRange(0, cap);
+        return drawList;
+    }
 
-        // Resolve current screen rects by coordinate once; the search ran against a copy, positions are live.
-        Dictionary<Vector2i, AtlasNodeDescription> descByCoord;
-        try {
-            var descs = AtlasPanel.Descriptions;
-            descByCoord = new Dictionary<Vector2i, AtlasNodeDescription>(descs.Count);
-            foreach (var d in descs)
-                descByCoord[d.Coordinate] = d;
-        } catch {
-            return;
-        }
-
-        // Fit the atlas coord->screen transform from the on-screen nodes whenever any piece of a drawn
-        // route has no live element to anchor to. The game rebuilds the panel's element list around the
-        // camera on every instance reload, so right after a map run most of a remembered route has no
-        // elements until the player pans back over it - the transform fills that gap by projecting the
-        // remembered coordinates instead, keeping the route visible. Deciding whether the fit is needed
-        // costs dictionary lookups only (a live element exists iff the coord is in descByCoord); the fit
-        // itself stays capped at 3*FitGridDim^2 rect reads. In the common case everything is live and the
-        // fit is skipped entirely.
-        AtlasTransform transform = default;   // Valid == false
-        bool needFit = false;
+    // Whether any piece of a drawn route lacks a live element to anchor to. The game rebuilds the
+    // panel's element list around the camera on every instance reload, so right after a map run a
+    // remembered route has no elements until the player pans back over it - the fitted transform
+    // fills that gap by projecting the remembered coordinates. A live element exists iff the coord
+    // is in descByCoord, so deciding costs lookups only.
+    private bool RoutesNeedFit(List<FinderResult> drawList, Dictionary<Vector2i, AtlasNodeDescription> descByCoord)
+    {
         foreach (var r in drawList) {
             if (r.Target != null && !descByCoord.ContainsKey(r.Target.Coord))
-                needFit = true;
-            if (!needFit && Settings.ShowPath && r.Path != null)
+                return true;
+            if (Settings.ShowPath && r.Path != null)
                 foreach (var pn in r.Path)
-                    if (pn != null && !descByCoord.ContainsKey(pn.Coord)) { needFit = true; break; }
-            if (!needFit && r.Stops != null)
+                    if (pn != null && !descByCoord.ContainsKey(pn.Coord))
+                        return true;
+            if (r.Stops != null)
                 foreach (var s in r.Stops)
-                    if (s?.Node != null && !descByCoord.ContainsKey(s.Node.Coord)) { needFit = true; break; }
-            if (!needFit && r.NearOptionals != null)
+                    if (s?.Node != null && !descByCoord.ContainsKey(s.Node.Coord))
+                        return true;
+            if (r.NearOptionals != null)
                 foreach (var no in r.NearOptionals)
-                    if (no?.Node != null && !descByCoord.ContainsKey(no.Node.Coord)) { needFit = true; break; }
-            if (needFit)
-                break;
+                    if (no?.Node != null && !descByCoord.ContainsKey(no.Node.Coord))
+                        return true;
         }
-        if (needFit && (DateTime.UtcNow - fitCacheAt).TotalSeconds >= FitReuseSeconds) {
-            // Refits pause whenever every route piece is live, so a gap since the last one starts a
-            // new episode - rejections from the previous one are not "consecutive" with this one.
+        return false;
+    }
+
+    // The per-frame transform policy: a full solve at most every FitReuseSeconds while wanted (capped
+    // at 3*FitGridDim^2 rect reads), the last gate-passing fit held through marginal rejections, and
+    // the held fit pan-followed every frame so estimates track the camera between solves. The
+    // pan-follow is offered even when nothing wants a fit: a repopulating element can read a zeroed
+    // rect for a frame or two, and the draw path then needs a projection to keep that piece from
+    // blinking off. Outside a wanted episode no refits run to keep the held fit current, so there it
+    // is only trusted when the anchor confirms it matches the camera.
+    private AtlasTransform ResolveAtlasTransform(Dictionary<Vector2i, AtlasNodeDescription> descByCoord, bool wantFit)
+    {
+        AtlasTransform transform = default;   // Valid == false
+        if (wantFit && (DateTime.UtcNow - fitCacheAt).TotalSeconds >= FitReuseSeconds) {
+            // Refits pause whenever nothing wants them, so a gap since the last one starts a new
+            // episode - rejections from the previous one are not "consecutive" with this one.
             if ((DateTime.UtcNow - fitCacheAt).TotalSeconds >= 2 * FitReuseSeconds)
                 hardRejectStreak = 0;
             var fresh = FitAtlasTransform(descByCoord);
@@ -2121,26 +2183,12 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 heldFitSet = false;
             }
         }
-        // The held fit pan-follows every frame, so estimated pieces track the camera between solves.
-        // It is offered even when every route coord has an element entry: a repopulating element can
-        // read a zeroed rect for a frame or two, and the draw path then needs a projection to keep
-        // that piece from blinking off. Outside a needFit episode no refits run to keep the held fit
-        // current, so there it is only trusted when the anchor confirms it matches the camera.
-        bool panAnchored = false;
         if (heldFitSet) {
-            var followed = PanFollow(heldFit, descByCoord, out panAnchored);
-            if (needFit || panAnchored)
+            var followed = PanFollow(heldFit, descByCoord, out bool panAnchored);
+            if (wantFit || panAnchored)
                 transform = followed;
         }
-
-        bool labelWithName = drawList.Count > 1;
-        foreach (var route in drawList) {
-            try {
-                DrawSingleRoute(route, descByCoord, transform, labelWithName);
-            } catch (Exception e) {
-                LogError($"Error drawing route '{route.PresetName}': {e.Message}\n{e.StackTrace}");
-            }
-        }
+        return transform;
     }
 
     private void DrawSingleRoute(FinderResult route, Dictionary<Vector2i, AtlasNodeDescription> descByCoord, AtlasTransform transform, bool labelWithName)
@@ -2369,6 +2417,29 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             if (!TryApply(x, y, out var p0) || !TryApply(x + 1, y, out var px) || !TryApply(x, y + 1, out var py))
                 return 0f;
             return Math.Max(Vector2.Distance(p0, px), Vector2.Distance(p0, py));
+        }
+
+        // Screen->coord through the adjugate, used to put the camera's viewport on the minimap. The
+        // result is round-tripped through TryApply so the forward guards decide validity - a screen
+        // point past the fitted horizon inverts to a coordinate whose forward image lands elsewhere.
+        public readonly bool TryApplyInverse(double sx, double sy, out double cx, out double cy)
+        {
+            cx = 0;
+            cy = 0;
+            double a00 = H11 * H22 - H12 * H21, a01 = H02 * H21 - H01 * H22, a02 = H01 * H12 - H02 * H11;
+            double a10 = H12 * H20 - H10 * H22, a11 = H00 * H22 - H02 * H20, a12 = H02 * H10 - H00 * H12;
+            double a20 = H10 * H21 - H11 * H20, a21 = H01 * H20 - H00 * H21, a22 = H00 * H11 - H01 * H10;
+            double w = a20 * sx + a21 * sy + a22;
+            if (w == 0 || !double.IsFinite(w))
+                return false;
+            cx = (a00 * sx + a01 * sy + a02) / w;
+            cy = (a10 * sx + a11 * sy + a12) / w;
+            if (!double.IsFinite(cx) || !double.IsFinite(cy))
+                return false;
+            if (!TryApply(cx, cy, out var back))
+                return false;
+            double bx = back.X - sx, by = back.Y - sy;
+            return bx * bx + by * by < 4;
         }
     }
 
@@ -2795,6 +2866,336 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         }
 
         return t;
+    }
+
+    #endregion
+
+    #region Minimap
+
+    // One remembered node as the minimap draws it: the lattice coordinate plus its dot class.
+    private struct MiniNode
+    {
+        public int X, Y;
+        public byte Cls;
+    }
+
+    // Dot classes, brightest first - when several nodes share a cell the brightest wins. Most of
+    // any explored atlas is unvisited, so the rare class - the trail of completed maps - gets the
+    // brightness; the frontier and the disk-remembered fill stay background texture, and nodes the
+    // game itself still hides under fog are barely there at all.
+    private const byte MiniVisited = 0;
+    private const byte MiniFrontier = 1;   // unlocked and confirmed live this session
+    private const byte MiniStale = 2;      // unlocked, but known only from the saved file
+    private const byte MiniHidden = 3;     // not unlocked - under the atlas' own fog of war
+
+    // Immutable overview of the remembered graph, swapped in whole by the worker (same publication
+    // contract as mapFinderResults - the render thread never reads cachedNodes). Mapping bounds are
+    // a render-side concern: they depend on the minimap basis, which only the render thread knows.
+    private sealed class MinimapSnapshot
+    {
+        public List<MiniNode> Nodes;
+    }
+
+    private volatile MinimapSnapshot minimapSnapshot;
+
+    // Render-side minimap state. The dot list is the snapshot projected into window-local pixels and
+    // deduped per 2px cell; it rebuilds only when the snapshot, the window size or the basis
+    // changes, so the per-frame work is just submitting rectangles.
+    private MinimapSnapshot minimapDotsFor;
+    private float minimapDotsWidth;
+    private int minimapDotsBasis = -1;
+    private readonly List<(Vector2 At, byte Cls)> minimapDots = new();
+    // The minimap basis: the linear part of the coord->screen map with the zoom divided out, read
+    // off the fitted transform around its anchor. The lattice runs diagonally on screen, so the
+    // basis must carry the full 2x2 - rotation, reflection and shear - to match the view's
+    // arrangement. Identity until the first valid fit; the version stamps the caches built from it.
+    private float minimapBasisXX = 1f, minimapBasisXY, minimapBasisYX, minimapBasisYY = 1f;
+    private bool minimapBasisSet;
+    private int minimapBasisVersion;
+    // Pixels one lattice step spans on screen (geometric mean across axes), read off the same probe
+    // as the basis; sizes the viewport box. The relative hysteresis keeps refit-to-refit jitter
+    // from making the box breathe while real zoom changes pass straight through.
+    private float minimapZoom;
+    // Basis-space percentile box of the snapshot (1st..99th per axis), so one far-flung island (a
+    // logbook extension, a stray unique) cannot crush the dense region into a corner; outliers are
+    // clamped onto the frame at draw time instead.
+    private MinimapSnapshot minimapBoundsFor;
+    private int minimapBoundsBasis = -1;
+    private float minimapMinX, minimapMaxX, minimapMinY, minimapMaxY;
+    private bool minimapPosApplied;
+    private Vector2 minimapPosScreen;
+
+    private static uint Rgba(byte r, byte g, byte b, byte a) => (uint)(a << 24 | b << 16 | g << 8 | r);
+
+    // Landmass tone per dot class: the unlocked ground in slate - confirmed this session over
+    // disk-remembered - while ground the game still fogs stays a hint above the window background,
+    // matching the black it gets on the atlas itself. A bright pip marks each completed map.
+    // Empty window is ground the graph has never recorded at all.
+    private static readonly uint[] MinimapLand = {
+        Rgba(88, 108, 130, 215),    // visited - same ground as the frontier, the pip carries it
+        Rgba(88, 108, 130, 215),    // frontier
+        Rgba(52, 58, 68, 150),      // stale
+        Rgba(33, 36, 42, 100),      // hidden
+    };
+    private static readonly uint MinimapTrail = Rgba(232, 232, 238, 255);
+
+    // Worker-only. Rebuilds the published minimap snapshot from the cache; runs wherever
+    // cachedNodeCount is republished. One pass, cheap at scan cadence.
+    private void PublishMinimapSnapshot()
+    {
+        int count = cachedNodes.Count;
+        if (count == 0) {
+            minimapSnapshot = null;
+            return;
+        }
+        var nodes = new List<MiniNode>(count);
+        foreach (var n in cachedNodes.Values) {
+            byte cls = !n.Unlocked ? MiniHidden
+                : !n.SeenLive ? MiniStale
+                : n.Visited ? MiniVisited
+                : MiniFrontier;
+            nodes.Add(new MiniNode { X = n.Coord.X, Y = n.Coord.Y, Cls = cls });
+        }
+        // Keep the old object when nothing changed: the render-side caches key on the snapshot
+        // reference, so republishing identical content would rebuild them once per scan for nothing.
+        var prev = minimapSnapshot;
+        if (prev != null && prev.Nodes.Count == count) {
+            bool same = true;
+            for (int i = 0; i < count; i++) {
+                var a = prev.Nodes[i];
+                var b = nodes[i];
+                if (a.X != b.X || a.Y != b.Y || a.Cls != b.Cls) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same)
+                return;
+        }
+        minimapSnapshot = new MinimapSnapshot { Nodes = nodes };
+    }
+
+    // The minimap window: every remembered node as a dot, the camera's current viewport as a box,
+    // and a marker per active search. Chromeless and draggable - the dragged position is the
+    // configurable position, remembered in the settings; locking it makes it click-through.
+    private void DrawMinimap(MinimapSnapshot snap, List<FinderResult> drawList, AtlasTransform transform)
+    {
+        double screenCX = (cachedScreenRect.Left + cachedScreenRect.Right) * 0.5;
+        double screenCY = (cachedScreenRect.Top + cachedScreenRect.Bottom) * 0.5;
+
+        // Where the camera is looking, as a lattice coordinate: the screen center pulled back
+        // through the live (pan-followed) transform. The viewport box hangs off it.
+        double camX = 0, camY = 0;
+        bool camOk = transform.Valid
+            && transform.TryApplyInverse(screenCX, screenCY, out camX, out camY);
+
+        // The minimap must be arranged the way the camera draws the lattice, or panning left would
+        // move the box right. Read the Jacobian at a fixed screen point - the screen center - and
+        // divide out the zoom, leaving a unit-area basis: minimap directions then equal screen
+        // directions by construction. The probe reads the held solve at the coordinate that solve
+        // put under the center, never the pan-followed transform: a screen-space translation models
+        // a pan correctly only near where the fit was solved, so geometry read through it picks up
+        // keystone error that grows with the pan. The held solve is static between refits, so the
+        // basis can only move when a fresh solve lands, and the epsilon absorbs solve noise.
+        if (heldFitSet
+            && heldFit.TryApplyInverse(screenCX, screenCY, out var probeX, out var probeY)
+            && heldFit.TryApply(probeX, probeY, out var fo)
+            && heldFit.TryApply(probeX + 1, probeY, out var fx)
+            && heldFit.TryApply(probeX, probeY + 1, out var fy)) {
+            float jxx = fx.X - fo.X, jxy = fy.X - fo.X;
+            float jyx = fx.Y - fo.Y, jyy = fy.Y - fo.Y;
+            float det = jxx * jyy - jxy * jyx;
+            if (Math.Abs(det) > 1e-3f) {
+                float zoom = MathF.Sqrt(Math.Abs(det));
+                if (minimapZoom <= 0f || Math.Abs(zoom - minimapZoom) > 0.05f * minimapZoom)
+                    minimapZoom = zoom;
+                float unit = 1f / zoom;
+                float nxx = jxx * unit, nxy = jxy * unit, nyx = jyx * unit, nyy = jyy * unit;
+                if (!minimapBasisSet
+                    || Math.Abs(nxx - minimapBasisXX) > 0.02f || Math.Abs(nxy - minimapBasisXY) > 0.02f
+                    || Math.Abs(nyx - minimapBasisYX) > 0.02f || Math.Abs(nyy - minimapBasisYY) > 0.02f) {
+                    minimapBasisXX = nxx;
+                    minimapBasisXY = nxy;
+                    minimapBasisYX = nyx;
+                    minimapBasisYY = nyy;
+                    minimapBasisSet = true;
+                    minimapBasisVersion++;
+                }
+            }
+        }
+
+        if (!ReferenceEquals(minimapBoundsFor, snap) || minimapBoundsBasis != minimapBasisVersion) {
+            minimapBoundsFor = snap;
+            minimapBoundsBasis = minimapBasisVersion;
+            int count = snap.Nodes.Count;
+            var xs = new float[count];
+            var ys = new float[count];
+            for (int i = 0; i < count; i++) {
+                var n = snap.Nodes[i];
+                xs[i] = minimapBasisXX * n.X + minimapBasisXY * n.Y;
+                ys[i] = minimapBasisYX * n.X + minimapBasisYY * n.Y;
+            }
+            Array.Sort(xs);
+            Array.Sort(ys);
+            int lo = count / 100, hi = count - 1 - count / 100;
+            minimapMinX = xs[lo];
+            minimapMaxX = xs[hi];
+            minimapMinY = ys[lo];
+            minimapMaxY = ys[hi];
+        }
+
+        // Window shape follows the remembered atlas' aspect as drawn, clamped so a freshly scanned
+        // strip cannot produce a sliver of a window.
+        const float Inset = 6f;
+        float width = Settings.MinimapSize.Value;
+        float spanX = Math.Max(1f, minimapMaxX - minimapMinX);
+        float spanY = Math.Max(1f, minimapMaxY - minimapMinY);
+        float innerW = width - 2 * Inset;
+        float innerH = innerW * Math.Clamp(spanY / spanX, 0.6f, 1.2f);
+        float height = innerH + 2 * Inset;
+
+        // Re-validate after a resolution change too, so a window parked near the old right edge is
+        // not stranded off screen (a locked one cannot even be dragged back).
+        if (minimapPosApplied
+            && (minimapPosScreen.X != cachedScreenRect.Width || minimapPosScreen.Y != cachedScreenRect.Height))
+            minimapPosApplied = false;
+        if (!minimapPosApplied) {
+            minimapPosApplied = true;
+            minimapPosScreen = new Vector2(cachedScreenRect.Width, cachedScreenRect.Height);
+            var saved = new Vector2(Settings.MinimapPosX, Settings.MinimapPosY);
+            bool savedUsable = saved.X >= 0 && saved.Y >= 0
+                && saved.X <= cachedScreenRect.Width - 40 && saved.Y <= cachedScreenRect.Height - 40;
+            ImGui.SetNextWindowPos(savedUsable ? saved : new Vector2(cachedScreenRect.Width - width - 40, 130), ImGuiCond.Always);
+        }
+        ImGui.SetNextWindowSize(new Vector2(width, height), ImGuiCond.Always);
+        ImGui.SetNextWindowBgAlpha(Settings.MinimapOpacity.Value);
+
+        var flags = ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoScrollbar
+                  | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav
+                  | ImGuiWindowFlags.NoSavedSettings;
+        if (Settings.MinimapLocked)
+            flags |= ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoInputs;
+
+        if (!ImGui.Begin("##OptiPatherMinimap", flags)) {
+            ImGui.End();
+            return;
+        }
+        try {
+            var winPos = ImGui.GetWindowPos();
+            Settings.MinimapPosX = winPos.X;
+            Settings.MinimapPosY = winPos.Y;
+
+            // Uniform scale, centered: the percentile box fills the inner rect. Outliers project
+            // outside and are clamped onto the frame, the way off-screen arrows pin to the screen edge.
+            float scale = Math.Min(innerW / spanX, innerH / spanY);
+            float midX = (minimapMinX + minimapMaxX) * 0.5f;
+            float midY = (minimapMinY + minimapMaxY) * 0.5f;
+            var origin = winPos + new Vector2(Inset, Inset);
+
+            Vector2 ProjectLocal(float x, float y) => new(
+                Math.Clamp(innerW * 0.5f + (minimapBasisXX * x + minimapBasisXY * y - midX) * scale, 0, innerW),
+                Math.Clamp(innerH * 0.5f + (minimapBasisYX * x + minimapBasisYY * y - midY) * scale, 0, innerH));
+            Vector2 Project(float x, float y) => origin + ProjectLocal(x, y);
+
+            // Dots snap to a 2px dedup grid, the strongest class claiming each cell; the list is
+            // kept sorted dim-to-bright so where grown squares overlap, live ground covers stale.
+            if (!ReferenceEquals(minimapDotsFor, snap) || minimapDotsWidth != width || minimapDotsBasis != minimapBasisVersion) {
+                minimapDotsFor = snap;
+                minimapDotsWidth = width;
+                minimapDotsBasis = minimapBasisVersion;
+                var cells = new Dictionary<int, (Vector2 At, byte Cls)>(snap.Nodes.Count);
+                foreach (var n in snap.Nodes) {
+                    var p = ProjectLocal(n.X, n.Y);
+                    int cellX = (int)(p.X * 0.5f), cellY = (int)(p.Y * 0.5f);
+                    int key = (cellX << 16) | cellY;
+                    if (!cells.TryGetValue(key, out var cur) || n.Cls < cur.Cls)
+                        cells[key] = (new Vector2(cellX * 2, cellY * 2), n.Cls);
+                }
+                minimapDots.Clear();
+                minimapDots.AddRange(cells.Values);
+                minimapDots.Sort((a, b) => b.Cls.CompareTo(a.Cls));
+            }
+
+            // The squares grow with the per-coord scale so neighbouring lattice nodes overlap into
+            // a filled silhouette - the lattice leaves half its grid cells empty, so bare 2px cells
+            // would render as a checkerboard. Two layers: every cell first paints the explored
+            // landmass, live ground over ground still under fog, and completed maps then drop a
+            // bright pip on top. Accents over one continuous field - rather than a color per cell -
+            // keep the trail from shredding the silhouette into speckle.
+            var dl = ImGui.GetWindowDrawList();
+            float dotPx = Math.Clamp(MathF.Ceiling(scale) + 1, 2, 6);
+            foreach (var (at, cls) in minimapDots) {
+                var p = origin + at;
+                dl.AddRectFilled(p, p + new Vector2(dotPx, dotPx), MinimapLand[cls]);
+            }
+            float pipPx = Math.Max(2f, dotPx - 2f);
+            var pipOff = new Vector2((dotPx - pipPx) * 0.5f, (dotPx - pipPx) * 0.5f);
+            foreach (var (at, cls) in minimapDots) {
+                if (cls != MiniVisited)
+                    continue;
+                var p = origin + at + pipOff;
+                dl.AddRectFilled(p, p + new Vector2(pipPx, pipPx), MinimapTrail);
+            }
+
+            // Paths, then the viewport box, then the targets - markers must survive the overdraw.
+            // Each path rides on a dark underlay: route colors are user-picked and can land near
+            // the landmass hue, so contrast comes from the outline rather than the color.
+            foreach (var route in drawList) {
+                if (route.Path is not { Count: > 1 })
+                    continue;
+                uint pathCol = Rgba(route.Color.R, route.Color.G, route.Color.B, 235);
+                for (int pass = 0; pass < 2; pass++) {
+                    uint col = pass == 0 ? Rgba(0, 0, 0, 160) : pathCol;
+                    float w = pass == 0 ? 3.5f : 1.5f;
+                    bool has = false;
+                    Vector2 prev = default;
+                    foreach (var pn in route.Path) {
+                        if (pn == null)
+                            continue;
+                        var p = Project(pn.Coord.X, pn.Coord.Y);
+                        if (has)
+                            dl.AddLine(prev, p, col, w);
+                        prev = p;
+                        has = true;
+                    }
+                }
+            }
+
+            // The box pops in once a fit validates (sub-second after the atlas opens); a held fit
+            // that went stale never freezes a wrong box because the transform arrives invalid then.
+            // Only the camera coordinate is mapped - corner preimages each carry their own
+            // perspective denominator, which makes a four-corner box breathe and shear under
+            // panning. The extent is just the screen size over the zoom, drawn screen-aligned.
+            if (camOk && minimapZoom > 0f) {
+                float lx = innerW * 0.5f + (minimapBasisXX * (float)camX + minimapBasisXY * (float)camY - midX) * scale;
+                float ly = innerH * 0.5f + (minimapBasisYX * (float)camX + minimapBasisYY * (float)camY - midY) * scale;
+                float halfW = cachedScreenRect.Width * 0.5f / minimapZoom * scale;
+                float halfH = cachedScreenRect.Height * 0.5f / minimapZoom * scale;
+                dl.AddRect(origin + new Vector2(Math.Clamp(lx - halfW, 0, innerW), Math.Clamp(ly - halfH, 0, innerH)),
+                           origin + new Vector2(Math.Clamp(lx + halfW, 0, innerW), Math.Clamp(ly + halfH, 0, innerH)),
+                           Rgba(255, 200, 90, 230), 0f, ImDrawFlags.None, 2f);
+            }
+
+            foreach (var route in drawList) {
+                uint col = Rgba(route.Color.R, route.Color.G, route.Color.B, 255);
+                if (route.Stops != null)
+                    foreach (var s in route.Stops) {
+                        if (s?.Node == null || s.Node.Visited)
+                            continue;
+                        var p = Project(s.Node.Coord.X, s.Node.Coord.Y);
+                        dl.AddCircleFilled(p, 3f, Rgba(0, 0, 0, 170));
+                        dl.AddCircleFilled(p, 2f, col);
+                    }
+                if (route.Target != null && !route.Target.Visited) {
+                    var t = Project(route.Target.Coord.X, route.Target.Coord.Y);
+                    dl.AddCircleFilled(t, 3.5f, Rgba(0, 0, 0, 170));
+                    dl.AddCircleFilled(t, 2.5f, col);
+                    dl.AddCircle(t, 4.5f, col, 12, 1.5f);
+                }
+            }
+        } finally {
+            ImGui.End();
+        }
     }
 
     #endregion
