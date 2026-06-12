@@ -80,6 +80,14 @@ public class OptiPatherSettings : ISettings
     [Menu("Lock Minimap", "Fix the minimap in place and let the mouse click through it.")]
     public ToggleNode MinimapLocked { get; set; } = new ToggleNode(false);
 
+    [ConditionalDisplay(nameof(ShowMinimap), true)]
+    [Menu("Click to Pan", "Ctrl+click a spot on the minimap to pan the atlas there. Works on a locked minimap too - the lock lifts while Ctrl is held. Escape cancels a pan in progress.")]
+    public ToggleNode ClickToPan { get; set; } = new ToggleNode(true);
+
+    [ConditionalDisplay(nameof(ClickToPan), true)]
+    [Menu("Pan Speed", "How aggressively click-to-pan swipes the atlas. Higher is snappier: longer swipes with shorter pauses between them. If the view overshoots and corrects a lot on your machine, turn it down.")]
+    public RangeNode<int> PanSpeed { get; set; } = new RangeNode<int>(7, 1, 10);
+
     // Last dragged minimap position, remembered across sessions; negative means not placed yet
     // (it then defaults to the top-right corner).
     public float MinimapPosX { get; set; } = -1f;

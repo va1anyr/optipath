@@ -7,6 +7,7 @@ using System.Numerics;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using System.Windows.Forms;
 
 using ExileCore2;
 using ExileCore2.PoEMemory.Elements.AtlasElements;
@@ -30,7 +31,7 @@ namespace OptiPather;
 // loop only resolves live node positions for drawing.
 public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 {
-    public const string Version = "2.3.8";
+    public const string Version = "3.0.0";
 
     // On-disk graph format version. Bump on any schema change to NodeDto/EdgeDto/GraphSnapshot;
     // a file written by a different version is discarded and rebuilt by re-panning the atlas.
@@ -351,6 +352,26 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         base.DrawSettings();
     }
 
+    // A pan in flight holds the game's mouse button down; whatever tears this plugin down -
+    // closing, unloading, a hot reload - must release it first, or the game keeps dragging.
+    public override void OnClose()
+    {
+        AbortPan();
+        base.OnClose();
+    }
+
+    public override void OnUnload()
+    {
+        AbortPan();
+        base.OnUnload();
+    }
+
+    public override void OnPluginDestroyForHotReload()
+    {
+        AbortPan();
+        base.OnPluginDestroyForHotReload();
+    }
+
     public override void Tick()
     {
         UI = GameController?.Game?.IngameState?.IngameUi;
@@ -448,8 +469,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
     public override void Render()
     {
-        if (AtlasPanel == null)
+        if (AtlasPanel == null) {
+            AbortPan();
             return;
+        }
 
         CheckKeybinds();
 
@@ -458,13 +481,20 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             catch (Exception e) { LogError("Error drawing map finder panel: " + e.Message + "\n" + e.StackTrace); }
         }
 
-        if (!AtlasPanel.IsVisible)
+        if (!AtlasPanel.IsVisible) {
+            AbortPan();
             return;
+        }
 
         UpdateScreenBounds();
 
+        // A throw in here skips the AdvancePan call at its tail, and a drag could be holding the
+        // game's mouse button right now - so a failed overlay frame also lets go of the pan.
         try { DrawAtlasOverlays(); }
-        catch (Exception e) { LogError("Error drawing atlas overlays: " + e.Message + "\n" + e.StackTrace); }
+        catch (Exception e) {
+            AbortPan();
+            LogError("Error drawing atlas overlays: " + e.Message + "\n" + e.StackTrace);
+        }
     }
 
     private void CheckKeybinds()
@@ -2042,6 +2072,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     {
         var snap = minimapSnapshot;
         bool minimapOn = Settings.ShowMinimap && snap is { Nodes.Count: > 0 };
+        // A pan cannot outlive the minimap it was aimed on: without the window there is no
+        // crosshair, no Ctrl gesture and nothing showing where the cursor went.
+        if (!minimapOn)
+            AbortPan();
         if (!Settings.ShowOnAtlas && !minimapOn)
             return;
 
@@ -2067,12 +2101,13 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         }
 
         AtlasTransform transform = default;   // Valid == false
+        bool anchored = false;
         if (descByCoord != null) {
             // Routes want the fit when any drawn piece lacks a live anchor; the minimap wants it
             // for its viewport box. In the common case everything is live, the minimap is off and
             // the fit is skipped entirely.
             bool needFit = routesOn && RoutesNeedFit(drawList, descByCoord);
-            transform = ResolveAtlasTransform(descByCoord, needFit || minimapOn);
+            transform = ResolveAtlasTransform(descByCoord, needFit || minimapOn, out anchored);
         }
 
         if (routesOn && descByCoord != null) {
@@ -2093,6 +2128,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 LogError("Error drawing minimap: " + e.Message + "\n" + e.StackTrace);
             }
         }
+
+        AdvancePan(transform, anchored);
     }
 
     // The routes allowed on screen this frame: one per checked (active) search with an unvisited
@@ -2159,9 +2196,12 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     // pan-follow is offered even when nothing wants a fit: a repopulating element can read a zeroed
     // rect for a frame or two, and the draw path then needs a projection to keep that piece from
     // blinking off. Outside a wanted episode no refits run to keep the held fit current, so there it
-    // is only trusted when the anchor confirms it matches the camera.
-    private AtlasTransform ResolveAtlasTransform(Dictionary<Vector2i, AtlasNodeDescription> descByCoord, bool wantFit)
+    // is only trusted when the anchor confirms it matches the camera. anchored surfaces that same
+    // confirmation to the caller: drawing tolerates a stale-but-held solve, but anything that acts
+    // on the camera position - the click-to-pan measure - must not.
+    private AtlasTransform ResolveAtlasTransform(Dictionary<Vector2i, AtlasNodeDescription> descByCoord, bool wantFit, out bool anchored)
     {
+        anchored = false;
         AtlasTransform transform = default;   // Valid == false
         if (wantFit && (DateTime.UtcNow - fitCacheAt).TotalSeconds >= FitReuseSeconds) {
             // Refits pause whenever nothing wants them, so a gap since the last one starts a new
@@ -2184,8 +2224,8 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             }
         }
         if (heldFitSet) {
-            var followed = PanFollow(heldFit, descByCoord, out bool panAnchored);
-            if (wantFit || panAnchored)
+            var followed = PanFollow(heldFit, descByCoord, out anchored);
+            if (wantFit || anchored)
                 transform = followed;
         }
         return transform;
@@ -3070,11 +3110,29 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         ImGui.SetNextWindowSize(new Vector2(width, height), ImGuiCond.Always);
         ImGui.SetNextWindowBgAlpha(Settings.MinimapOpacity.Value);
 
+        // Ctrl arms the click-to-pan gesture: a locked window takes inputs again for exactly that
+        // long (plain clicks keep passing through), and an unlocked one stops moving so the click
+        // cannot nudge it. Ctrl is read from the polled keyboard, never ImGui's IO: the overlay
+        // only hears the keyboard once it has focus, and focus only arrives after a click already
+        // landed - a locked window would wait forever for the Ctrl that is supposed to unlock it.
+        // While a pan runs, the window goes input-transparent in both modes - the synthetic drag
+        // underneath must reach the game, not this window.
+        bool ctrlHeld = Input.IsKeyDown(Keys.ControlKey);
+        bool clickArmed = Settings.ClickToPan && ctrlHeld && !panActive;
         var flags = ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoScrollbar
                   | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav
                   | ImGuiWindowFlags.NoSavedSettings;
-        if (Settings.MinimapLocked)
-            flags |= ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoInputs;
+        // panPressArmed keeps a window with a Ctrl-armed press in flight interactive even after
+        // Ctrl lifts, so the release that finishes the gesture still lands here.
+        if (Settings.MinimapLocked) {
+            flags |= ImGuiWindowFlags.NoMove;
+            if (!clickArmed && !panPressArmed)
+                flags |= ImGuiWindowFlags.NoInputs;
+        } else if (clickArmed || panPressArmed) {
+            flags |= ImGuiWindowFlags.NoMove;
+        }
+        if (panActive)
+            flags |= ImGuiWindowFlags.NoInputs;
 
         if (!ImGui.Begin("##OptiPatherMinimap", flags)) {
             ImGui.End();
@@ -3193,9 +3251,237 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                     dl.AddCircle(t, 4.5f, col, 12, 1.5f);
                 }
             }
+
+            // Destination crosshair while a pan is in flight, so the jump has a visible goal.
+            if (panActive) {
+                var tgt = origin + ProjectLocal((float)panTargetX, (float)panTargetY);
+                uint col = Rgba(255, 200, 90, 230);
+                dl.AddCircle(tgt, 5f, col, 12, 1.5f);
+                dl.AddLine(tgt - new Vector2(8, 0), tgt + new Vector2(8, 0), col, 1f);
+                dl.AddLine(tgt - new Vector2(0, 8), tgt + new Vector2(0, 8), col, 1f);
+            }
+
+            // The armed click: fires on the release edge, so the physical button is already up
+            // before any synthetic input goes out - arming on the press would interleave the
+            // user's own release into the synthetic drag while the overlay still owns the mouse.
+            // A press that began armed stays armed through its own release (the latch is a bool,
+            // nothing synthetic moves before the edge), so lifting Ctrl a beat before the button -
+            // the way most Ctrl+clicks end - still pans. Inverts the projection (the basis has
+            // unit determinant, so its inverse is exact) and starts the pan loop toward that
+            // coordinate.
+            if (ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                panPressArmed = clickArmed && ImGui.IsWindowHovered();
+            if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) {
+                bool armed = !panActive && (clickArmed || panPressArmed)
+                    && minimapBasisSet && minimapZoom > 0f && ImGui.IsWindowHovered();
+                panPressArmed = false;
+                var local = ImGui.GetMousePos() - origin;
+                if (armed && local.X >= 0 && local.X <= innerW && local.Y >= 0 && local.Y <= innerH) {
+                    float mx = (local.X - innerW * 0.5f) / scale + midX;
+                    float my = (local.Y - innerH * 0.5f) / scale + midY;
+                    float bdet = minimapBasisXX * minimapBasisYY - minimapBasisXY * minimapBasisYX;
+                    panTargetX = (minimapBasisYY * mx - minimapBasisXY * my) / bdet;
+                    panTargetY = (minimapBasisXX * my - minimapBasisYX * mx) / bdet;
+                    panReturnPos = ImGui.GetMousePos();
+                    panDragsLeft = MaxPanDrags;
+                    panInvalidSince = DateTime.MinValue;
+                    panMovedCursor = false;
+                    panFramesSinceArm = 0;
+                    panPhase = PanPhase.Measure;
+                    panPhaseAt = DateTime.UtcNow;
+                    panActive = true;
+                }
+            }
         } finally {
             ImGui.End();
         }
+    }
+
+    #endregion
+
+    #region Click to pan
+
+    // The pan runs as a closed loop of synthetic drags: measure where the camera is via the live
+    // transform, drag a clamped step toward the target, let the view settle, re-measure. Each
+    // iteration corrects whatever the previous drag missed (perspective makes pixels-per-coord vary
+    // across the screen, so a single dead-reckoned drag would always land short or long).
+    private const float PanDonePx = 30f;          // remaining offset that counts as "arrived"
+    // Runaway guard, not a travel budget: at any stride twelve drags out-span the atlas several
+    // times over, so hitting this means the loop stopped converging, not that the target was far.
+    private const int MaxPanDrags = 12;
+
+    // Every pacing knob interpolates between a relaxed profile and an aggressive one as the speed
+    // setting rises: longer strides need fewer round trips, shorter waits start them sooner. The
+    // slow end is the conservative profile the gesture was first tuned at; the fast end keeps
+    // enough of a move stream that the game still reads the gesture as a drag, never a click.
+    private float PanDial => (Settings.PanSpeed.Value - 1) / 9f;
+    private float PanStride => 0.35f + 0.30f * PanDial;        // of the screen, per axis
+    private int PanSettleMs => 300 - (int)(210 * PanDial);     // release -> re-measure
+    private int PanPlaceMs => 40 - (int)(25 * PanDial);        // cursor placed -> press
+    private int PanPressMs => 30 - (int)(15 * PanDial);        // press -> first move
+    private int PanStepMs => 16 - (int)(6 * PanDial);          // between move steps
+    private int PanReleaseMs => 40 - (int)(20 * PanDial);      // last move -> release
+    private int PanSteps => 6 - (int)MathF.Round(2 * PanDial);
+
+    private enum PanPhase { Measure, Press, Drag, Release, Settle }
+
+    private bool panActive;
+    private PanPhase panPhase;
+    private double panTargetX, panTargetY;
+    private int panDragsLeft;
+    private DateTime panPhaseAt;
+    private Vector2 panDragFrom, panDragTo;
+    private int panDragStep;
+    // Step count frozen when the drag is planned, so a speed change mid-stroke cannot extrapolate
+    // the cursor past the planned endpoint.
+    private int panStepsTotal;
+    private bool panMouseDown;
+    // Whether any synthetic cursor move has gone out for the current pan; a cursor the pan never
+    // touched is the user's to keep, even on abort.
+    private bool panMovedCursor;
+    private Vector2 panReturnPos;
+    private DateTime panInvalidSince = DateTime.MinValue;
+    // Frames rendered since the pan armed. The overlay sheds its OS-level clickability a couple
+    // of frames after the plugin windows go input-transparent, and a press fired into that lag
+    // lands on the overlay instead of the game - so the first press waits a few frames out.
+    private int panFramesSinceArm;
+    // Set on a press that began Ctrl-armed, so its release still pans when Ctrl lifts first.
+    private bool panPressArmed;
+
+    private static Vector2 ClampInto(Vector2 p, RectangleF r) => new(
+        Math.Clamp(p.X, r.Left, r.Right), Math.Clamp(p.Y, r.Top, r.Bottom));
+
+    private void AdvancePan(AtlasTransform transform, bool anchored)
+    {
+        if (!panActive)
+            return;
+        if (!Settings.ClickToPan || Input.IsKeyDown(Keys.Escape)) {
+            AbortPan();
+            return;
+        }
+        // The synthetic input must reach the game, so the whole overlay is forced click-through
+        // for as long as the pan runs. Per-window NoInputs is not enough: child windows (lists,
+        // scrolling tables) do not inherit it, and any of them hovering under the parked cursor
+        // would turn the overlay clickable and feed the next press to a widget instead.
+        ImGui.SetNextFrameWantCaptureMouse(false);
+        panFramesSinceArm++;
+        var now = DateTime.UtcNow;
+        if (now < panPhaseAt)
+            return;
+
+        switch (panPhase) {
+            case PanPhase.Measure: {
+                // Never start a drag while the physical button is down (the user grabbing the
+                // mouse mid-pan) - the two input streams would interleave. Polled for the same
+                // reason Ctrl is: with every window input-transparent mid-pan, ImGui never hears
+                // the user's button. The synthetic button is up in this phase, so a polled down
+                // can only be the user's.
+                if (Input.IsKeyDown(Keys.LButton))
+                    return;
+                // Only this phase needs live geometry; a drag in flight never stalls on a fitless
+                // frame with the button parked down. anchored matters as much as Valid: right
+                // after a drag the held solve can survive a failed refit unshifted, and measuring
+                // through it reads the pre-drag camera and re-issues the same drag.
+                double camX = 0, camY = 0;
+                bool camOk = anchored && minimapZoom > 0f && transform.Valid
+                    && transform.TryApplyInverse((cachedScreenRect.Left + cachedScreenRect.Right) * 0.5,
+                                                 (cachedScreenRect.Top + cachedScreenRect.Bottom) * 0.5,
+                                                 out camX, out camY);
+                // A big drag can land the camera in a region too sparse to refit on the first few
+                // tries, so the wait is generous; the atlas closing aborts elsewhere long before this.
+                if (!camOk) {
+                    if (panInvalidSince == DateTime.MinValue)
+                        panInvalidSince = now;
+                    else if ((now - panInvalidSince).TotalSeconds > 2.5)
+                        AbortPan();
+                    return;
+                }
+                panInvalidSince = DateTime.MinValue;
+
+                // Remaining offset in screen pixels, via the held solve's basis and zoom; the box on
+                // the minimap is built from exactly these, so the loop and the display agree.
+                float dx = (float)(panTargetX - camX), dy = (float)(panTargetY - camY);
+                float sx = minimapZoom * (minimapBasisXX * dx + minimapBasisXY * dy);
+                float sy = minimapZoom * (minimapBasisYX * dx + minimapBasisYY * dy);
+                if (sx * sx + sy * sy < PanDonePx * PanDonePx) {
+                    if (panMovedCursor)
+                        Input.SetCursorPos(panReturnPos);
+                    panActive = false;
+                    return;
+                }
+                if (--panDragsLeft < 0) {
+                    AbortPan();
+                    return;
+                }
+
+                // Dragging moves the content with the cursor, so the drag vector is the negated
+                // offset, clamped to a fraction of the screen and kept inside a central band away
+                // from the game's edge UI. A drag with real movement never registers as a node
+                // click - that needs press and release on the same spot.
+                var safe = cachedScreenRect;
+                safe.Inflate(-cachedScreenRect.Width * 0.15f, -cachedScreenRect.Height * 0.15f);
+                float stride = PanStride;
+                var drag = new Vector2(
+                    Math.Clamp(-sx, -cachedScreenRect.Width * stride, cachedScreenRect.Width * stride),
+                    Math.Clamp(-sy, -cachedScreenRect.Height * stride, cachedScreenRect.Height * stride));
+                var center = new Vector2((cachedScreenRect.Left + cachedScreenRect.Right) * 0.5f,
+                                         (cachedScreenRect.Top + cachedScreenRect.Bottom) * 0.5f);
+                panDragFrom = ClampInto(center - drag * 0.5f, safe);
+                panDragTo = ClampInto(panDragFrom + drag, safe);
+                panDragStep = 0;
+                panStepsTotal = PanSteps;
+                panMovedCursor = true;
+                Input.SetCursorPos(panDragFrom);
+                panPhase = PanPhase.Press;
+                panPhaseAt = now.AddMilliseconds(PanPlaceMs);
+                return;
+            }
+            case PanPhase.Press:
+                // Only the first press of a pan can race the overlay's clickability lag; later
+                // ones run long after it has dropped.
+                if (panFramesSinceArm < 5)
+                    return;
+                Input.LeftDown();
+                panMouseDown = true;
+                panPhase = PanPhase.Drag;
+                panPhaseAt = now.AddMilliseconds(PanPressMs);
+                return;
+            case PanPhase.Drag:
+                panDragStep++;
+                Input.SetCursorPos(Vector2.Lerp(panDragFrom, panDragTo, panDragStep / (float)panStepsTotal));
+                if (panDragStep >= panStepsTotal) {
+                    panPhase = PanPhase.Release;
+                    panPhaseAt = now.AddMilliseconds(PanReleaseMs);
+                } else {
+                    panPhaseAt = now.AddMilliseconds(PanStepMs);
+                }
+                return;
+            case PanPhase.Release:
+                Input.LeftUp();
+                panMouseDown = false;
+                panPhase = PanPhase.Settle;
+                panPhaseAt = now.AddMilliseconds(PanSettleMs);
+                return;
+            case PanPhase.Settle:
+                panPhase = PanPhase.Measure;
+                return;
+        }
+    }
+
+    // Safe from any state: releases the button if a drag was mid-flight (the game must never be
+    // left with a stuck-down mouse) and puts the cursor back where the user clicked - but only
+    // when the pan actually moved it.
+    private void AbortPan()
+    {
+        if (!panActive)
+            return;
+        if (panMouseDown) {
+            try { Input.LeftUp(); } catch { }
+            panMouseDown = false;
+        }
+        if (panMovedCursor)
+            try { Input.SetCursorPos(panReturnPos); } catch { }
+        panActive = false;
     }
 
     #endregion
@@ -3208,7 +3494,13 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         ImGui.SetNextWindowSize(new Vector2(640, 470), ImGuiCond.FirstUseEver);
         ImGui.SetNextWindowBgAlpha(0.85f);
 
-        if (!ImGui.Begin($"Map Finder  v{Version}###OptiPatherMapFinder", ref MapFinderPanelIsOpen, ImGuiWindowFlags.NoCollapse)) {
+        // While a pan runs every plugin window goes input-transparent, not just the minimap: the
+        // synthetic stroke crosses the middle of the screen, and the cursor parking on this panel
+        // would turn the overlay clickable and feed the drag to the panel instead of the game.
+        var panelFlags = ImGuiWindowFlags.NoCollapse;
+        if (panActive)
+            panelFlags |= ImGuiWindowFlags.NoInputs;
+        if (!ImGui.Begin($"Map Finder  v{Version}###OptiPatherMapFinder", ref MapFinderPanelIsOpen, panelFlags)) {
             ImGui.End();
             return;
         }
