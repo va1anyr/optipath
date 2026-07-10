@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -35,7 +36,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
     // On-disk graph format version. Bump on any schema change to NodeDto/EdgeDto/GraphSnapshot;
     // a file written by a different version is discarded and rebuilt by re-panning the atlas.
-    private const int GraphSchemaVersion = 1;
+    private const int GraphSchemaVersion = 2;
     // Seconds of unsaved changes to tolerate before the worker writes the graph to disk.
     private const double SaveDebounceSeconds = 15;
     // Refuse to load a file claiming more nodes than this - a real atlas is far smaller, so a larger
@@ -80,6 +81,18 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
     // Latest computed routes (one per active/edited search), swapped in atomically by the worker.
     private volatile List<FinderResult> mapFinderResults = new();
+
+    // Ad-hoc next-hop lookups requested through the "OptiPather.GetNextMapStep" PluginBridge method (see
+    // Initialise/GetNextMapStepBridge). Keys are a normalized "namecontent" combo. Entries accumulate
+    // and are re-answered every scan - there's no expiry, but a consumer is expected to ask about a small,
+    // stable set of targets, not a different one every frame.
+    private readonly ConcurrentDictionary<string, (string Name, string Content)> nextStepRequests = new();
+    // Worker-published graph-only answers (see NextStepGraphInfo), keyed the same way; swapped in
+    // wholesale each scan - same atomic-reference-swap pattern as mapFinderResults.
+    private volatile Dictionary<string, NextStepGraphInfo> nextStepGraphInfo = new();
+    // Main-thread-published final answers (graph info + live screen position, see
+    // ResolveNextStepScreenPositions); this is what the bridge getter actually reads.
+    private volatile Dictionary<string, NextMapStep> nextStepResults = new();
 
     // Persistent atlas graph, accumulated across scans. AtlasPanel.Descriptions/Points only expose the
     // nodes near the current camera (they are UI elements), so a single scan sees just the viewport.
@@ -164,6 +177,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         public bool Visited;
         public bool Unlocked;
         public bool Active;
+        // IsVisible is false both for ordinary maps under atlas fog and for unavailable conditional
+        // nodes. It cannot be used as a general pathing gate; it is retained only to distinguish an
+        // unavailable Crux of Nothingness from one the game has made playable.
+        public bool Visible;
         // Content / map mods on the node (e.g. "Powerful Map Boss", "Corrupted Nexus", "Tower").
         public List<string> ContentTags;
         // True when this snapshot came from a live atlas scan this session; false for a node rebuilt
@@ -194,6 +211,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         public string Name { get; set; }
         public bool V { get; set; }   // Visited
         public bool U { get; set; }   // Unlocked
+        public bool S { get; set; }   // Structurally visible / currently available
         public List<string> T { get; set; }   // ContentTags
     }
 
@@ -311,6 +329,32 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         public List<NearOptional> Near;
     }
 
+    // Graph-only result of an ad-hoc "OptiPather.GetNextMapStep" bridge lookup, computed by the worker
+    // alongside its normal scan. Only Vector2i/int/string/bool - the worker never touches live game
+    // objects (see GraphNode), so it cannot resolve a screen position; that happens separately on the
+    // main thread (see NextMapStep / ResolveNextStepScreenPositions).
+    private sealed class NextStepGraphInfo
+    {
+        public bool Found { get; init; }
+        public string TargetMapName { get; init; }
+        public int TotalSteps { get; init; }
+        public Vector2i NextCoordinate { get; init; }
+        public string NextMapName { get; init; }
+    }
+
+    // Main-thread-merged next-step answer: NextStepGraphInfo plus the live screen position, resolved
+    // from AtlasPanel.Descriptions each Render frame. This is what "OptiPather.GetNextMapStep" returns.
+    private sealed class NextMapStep
+    {
+        public bool Found { get; init; }
+        public string TargetMap { get; init; }
+        public string NextMapName { get; init; }
+        public Vector2i NextCoordinate { get; init; }
+        public int HopsRemaining { get; init; }
+        public bool OnScreen { get; init; }
+        public Vector2 ScreenPosition { get; init; }
+    }
+
     public override bool Initialise()
     {
         Input.RegisterKey(Settings.MapFinderPanelHotkey);
@@ -322,6 +366,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
         MigrateLegacySearch();
         selectedPresetIndex = Settings.Presets.Count > 0 ? 0 : -1;
+
+        GameController.PluginBridge.SaveMethod("OptiPather.GetNextMapStep",
+            (Func<string, string, (bool Found, string TargetMap, string NextMapName, Vector2i NextCoordinate, int HopsRemaining, bool OnScreen, Vector2 ScreenPosition)>)
+            GetNextMapStepBridge);
 
         CanUseMultiThreading = true;
         return true;
@@ -344,6 +392,37 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             ColorArgb = PresetPalette[0].ToArgb(),
         });
     }
+
+    // PluginBridge entry point: "OptiPather.GetNextMapStep". Given a target map name (and optionally a
+    // content/mod filter, matched the same way a search's mandatory field is), returns the next map to
+    // select on the atlas in order to progress toward it - the first node along the shortest path from
+    // your completed/unlocked frontier that is not yet Visited (an Unlocked-but-not-run seed node counts:
+    // it's already selectable for the map device, so it IS the next step, not something to skip past).
+    // Merely calling this registers interest, which makes Tick() keep scanning the atlas while a consumer
+    // is asking (see the `active` check in Tick), the same as the map finder panel or an active search
+    // would.
+    //   Found          - false if no reachable match exists yet (nothing scanned, or no unvisited node
+    //                     on the graph currently matches the query)
+    //   TargetMap      - name of the ultimate matched map (may be several hops past NextMapName)
+    //   NextMapName    - name of the map to click next (never an already-Visited node)
+    //   NextCoordinate - its atlas graph coordinate (a stable identity even when off-screen)
+    //   HopsRemaining  - total hops from the frontier to TargetMap (not just to NextMapName)
+    //   OnScreen / ScreenPosition - true plus a clickable screen point when NextMapName's node is
+    //                     currently rendered by the game (in camera view this frame); when false the
+    //                     caller must pan the atlas there first (e.g. via OptiPather's own click-to-pan)
+    //                     before a click coordinate exists.
+    private (bool Found, string TargetMap, string NextMapName, Vector2i NextCoordinate, int HopsRemaining, bool OnScreen, Vector2 ScreenPosition)
+        GetNextMapStepBridge(string mapName, string contentFilter)
+    {
+        string key = NextStepKey(mapName, contentFilter);
+        nextStepRequests[key] = (mapName, contentFilter);
+        if (nextStepResults.TryGetValue(key, out var step))
+            return (step.Found, step.TargetMap, step.NextMapName, step.NextCoordinate, step.HopsRemaining, step.OnScreen, step.ScreenPosition);
+        return (false, mapName, null, default, -1, false, default);
+    }
+
+    private static string NextStepKey(string name, string content) =>
+        (name ?? "").Trim().ToLowerInvariant() + "" + (content ?? "").Trim().ToLowerInvariant();
 
     public override void DrawSettings()
     {
@@ -410,8 +489,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
         // Refresh every couple of seconds while a search is active (so step counts track progress),
         // while the panel is open (so the content dropdown stays populated as the atlas reveals
-        // more), or while the minimap is on - its overview is fed by these same scans.
-        bool active = AnyActivePreset() || MapFinderPanelIsOpen || Settings.ShowMinimap;
+        // more), while the minimap is on - its overview is fed by these same scans - or while another
+        // plugin has an outstanding OptiPather.GetNextMapStep bridge request (it needs the same scans
+        // even with the panel closed and no preset active).
+        bool active = AnyActivePreset() || MapFinderPanelIsOpen || Settings.ShowMinimap || !nextStepRequests.IsEmpty;
         if (active && !finderBusy && DateTime.Now.Subtract(lastFinderRecompute).TotalSeconds > 2)
             mapFinderDirty = true;
 
@@ -473,6 +554,9 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             AbortPan();
             return;
         }
+
+        try { ResolveNextStepScreenPositions(); }
+        catch (Exception e) { LogError("Error resolving next-map-step positions: " + e.Message + "\n" + e.StackTrace); }
 
         CheckKeybinds();
 
@@ -705,11 +789,12 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             if (el == null)
                 continue;
 
-            bool visited, unlocked, active;
+            bool visited, unlocked, active, visible;
             try {
                 visited = el.IsVisited;
                 unlocked = el.IsUnlocked;
                 active = el.IsActive;
+                visible = el.IsVisible;
             } catch {
                 continue;
             }
@@ -748,6 +833,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                     name = old.Name;
                     visited = old.Visited;
                     unlocked = old.Unlocked;
+                    visible = old.Visible;
                     tags = old.ContentTags ?? tags;
                     seenLive = old.SeenLive;
                 } else {
@@ -756,7 +842,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                         tags = old.ContentTags;
                 }
 
-                if (old.Visited != visited || old.Unlocked != unlocked
+                if (old.Visited != visited || old.Unlocked != unlocked || old.Visible != visible
                     || !string.Equals(old.Name, name, StringComparison.Ordinal)
                     || (old.ContentTags?.Count ?? 0) != tags.Count)
                     changed = true;
@@ -770,6 +856,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 Visited = visited,
                 Unlocked = unlocked,
                 Active = active,
+                Visible = visible,
                 ContentTags = tags,
                 SeenLive = seenLive,
             });
@@ -838,8 +925,12 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             persistDirty = true;
 
         // The accumulated cache IS the working graph for this scan.
-        var nodes = cachedNodes.Values.ToList();
-        var nodeByCoord = cachedNodes;
+        // IsVisible also goes false for every ordinary map under atlas fog, so it must not gate the
+        // graph as a whole. Crux of Nothingness is the known exception: unavailable instances remain
+        // described and connected despite not being traversable. Exclude only a hidden node with that
+        // exact area name; if the game later makes it visible, it becomes routable immediately.
+        var nodes = cachedNodes.Values.Where(n => !IsUnavailableCrux(n)).ToList();
+        var nodeByCoord = nodes.ToDictionary(n => n.Coord);
         var adjacency = cachedAdjacency;
 
         // A node with no links may be a not-yet-loaded connection (atlas.Points reads partially) rather
@@ -901,6 +992,18 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                 prev[next] = coord;
                 queue.Enqueue(next);
             }
+        }
+
+        // Ad-hoc next-hop lookups requested through the "OptiPather.GetNextMapStep" bridge (see
+        // GetNextMapStepBridge). Piggybacks on this scan's BFS since it needs the exact same seed
+        // distances; only the graph-level answer is produced here - the worker never touches live
+        // AtlasPanel elements (see GraphNode), so screen position is resolved separately on the main
+        // thread every Render frame (see ResolveNextStepScreenPositions).
+        if (!nextStepRequests.IsEmpty) {
+            var graphInfo = new Dictionary<string, NextStepGraphInfo>(StringComparer.Ordinal);
+            foreach (var kv in nextStepRequests)
+                graphInfo[kv.Key] = ComputeNextStepGraphInfo(kv.Value.Name, kv.Value.Content, nodes, dist, prev, nodeByCoord);
+            nextStepGraphInfo = graphInfo;
         }
 
         // Build one proximity field per distinct optional across all searches (deduped by key), so two
@@ -1596,6 +1699,10 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         return a.Match.Node.Coord.Y.CompareTo(b.Match.Node.Coord.Y);
     }
 
+    private static bool IsUnavailableCrux(GraphNode node) =>
+        !node.Visible
+        && string.Equals(node.Name, "Crux of Nothingness", StringComparison.OrdinalIgnoreCase);
+
     // A node matches when every active filter passes: the map name (substring) and/or the chosen
     // content/mod (exact match, ignoring case and spacing so "corruptednexus" == "Corrupted Nexus" but
     // never "Corrupted"). With no filter active nothing matches.
@@ -1773,6 +1880,53 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         return path;
     }
 
+    // Graph-only answer for an ad-hoc "OptiPather.GetNextMapStep" bridge lookup: the nearest reachable
+    // unvisited node matching (nameQuery, contentFilter), and the first not-yet-Visited node on the path
+    // to it from the completed/unlocked frontier - i.e. the node the map device can actually place a
+    // waystone on right now (see the comment inside this method for why that's not simply path[0] or
+    // path[1]). Mirrors ComputeSingleResult's candidate selection but ignores optionals/hysteresis
+    // entirely - a bridge caller wants a plain nearest-match answer, not the settings-tuned
+    // recommendation a saved search shows.
+    private static NextStepGraphInfo ComputeNextStepGraphInfo(string nameQuery, string contentFilter, List<GraphNode> nodes, Dictionary<Vector2i, int> dist, Dictionary<Vector2i, Vector2i> prev, Dictionary<Vector2i, GraphNode> nodeByCoord)
+    {
+        GraphNode best = null;
+        int bestSteps = int.MaxValue;
+        foreach (var n in nodes) {
+            if (n.Visited || !dist.TryGetValue(n.Coord, out int steps))
+                continue;
+            if (!MatchesFilters(n, nameQuery, contentFilter, out _))
+                continue;
+            if (steps < bestSteps) {
+                bestSteps = steps;
+                best = n;
+            }
+        }
+        if (best == null)
+            return new NextStepGraphInfo { Found = false };
+
+        // path[0] is the seed the route starts from, path[^1] is the target itself. The seed frontier
+        // (see the Seed() calls above) includes BOTH already-Visited nodes AND Unlocked-but-not-yet-run
+        // ones, so the seed is not always something to skip past: an Unlocked seed is itself the correct
+        // node to place a waystone on right now (it has no Traverse/waystone slot until you select it),
+        // while a Visited seed is one you already ran and must move past. Always using path[1] (tried
+        // 2026-07-08) overshoots past an Unlocked seed to a node that isn't selectable yet - live testing
+        // showed its atlas node only opens an info/description panel, no Traverse slot, because it's still
+        // locked behind the seed. Always using path[0] (tried 2026-07-07) undershoots the opposite way,
+        // permanently returning an already-Visited node a "reject stale answers" consumer never accepts.
+        // The map device can only actually place a waystone on the first node in the path that is not yet
+        // Visited - walk forward from the seed and stop there (the target itself is guaranteed unvisited
+        // by the candidate filter above, so this always finds something).
+        var path = ReconstructFinderPath(best.Coord, prev, nodeByCoord);
+        var next = path.Find(n => !n.Visited) ?? path[^1];
+        return new NextStepGraphInfo {
+            Found = true,
+            TargetMapName = best.Name,
+            TotalSteps = bestSteps,
+            NextCoordinate = next.Coord,
+            NextMapName = next.Name,
+        };
+    }
+
     #endregion
 
     #region Persistence
@@ -1909,6 +2063,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                     Visited = nd.V,
                     Unlocked = nd.U,
                     Active = false,
+                    Visible = nd.S,
                     ContentTags = nd.T ?? new List<string>(),
                     SeenLive = false,
                 };
@@ -1982,6 +2137,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                     Name = n.Name,
                     V = n.Visited,
                     U = n.Unlocked,
+                    S = n.Visible,
                     T = n.ContentTags is { Count: > 0 } ? n.ContentTags : null,
                 });
             }
@@ -2064,6 +2220,66 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
     #endregion
 
     #region Rendering
+
+    // Resolves each ad-hoc "OptiPather.GetNextMapStep" bridge answer's live screen position from this
+    // frame's AtlasPanel.Descriptions. The worker (ComputeNextStepGraphInfo) only ever produces a graph
+    // coordinate, since it must never touch live UI elements (see GraphNode) - this runs every Render
+    // frame instead, independent of the ShowOnAtlas/minimap toggles, but does nothing when nobody is
+    // asking (the common case).
+    private void ResolveNextStepScreenPositions()
+    {
+        var graphInfo = nextStepGraphInfo;
+        if (graphInfo.Count == 0) {
+            if (nextStepResults.Count != 0)
+                nextStepResults = new();
+            return;
+        }
+
+        Dictionary<Vector2i, AtlasNodeDescription> descByCoord;
+        try {
+            var descs = AtlasPanel.Descriptions;
+            descByCoord = new Dictionary<Vector2i, AtlasNodeDescription>(descs.Count);
+            foreach (var d in descs)
+                descByCoord[d.Coordinate] = d;
+        } catch {
+            return;   // unreadable this frame - keep the previous answers rather than blank them
+        }
+
+        var merged = new Dictionary<string, NextMapStep>(graphInfo.Count, StringComparer.Ordinal);
+        foreach (var kv in graphInfo) {
+            var info = kv.Value;
+            if (!info.Found) {
+                merged[kv.Key] = new NextMapStep { Found = false, TargetMap = info.TargetMapName };
+                continue;
+            }
+
+            bool onScreen = false;
+            Vector2 screenPos = default;
+            if (descByCoord.TryGetValue(info.NextCoordinate, out var d)) {
+                try {
+                    var rect = d.Element.GetClientRect();
+                    var center = rect.Center;
+                    // A repopulating element can read a zeroed rect without throwing - only trust it
+                    // as clickable once it has real extent (mirrors TryNodeScreenPos's own filter).
+                    if (rect.Right > rect.Left && (center.X != 0 || center.Y != 0)) {
+                        onScreen = true;
+                        screenPos = center;
+                    }
+                } catch { }
+            }
+
+            merged[kv.Key] = new NextMapStep {
+                Found = true,
+                TargetMap = info.TargetMapName,
+                NextMapName = info.NextMapName,
+                NextCoordinate = info.NextCoordinate,
+                HopsRemaining = info.TotalSteps,
+                OnScreen = onScreen,
+                ScreenPosition = screenPos,
+            };
+        }
+        nextStepResults = merged;
+    }
 
     // Everything drawn over the open atlas: the route overlay and the minimap. Both need the same
     // groundwork - the live element index and the fitted coord->screen transform - so it is resolved
@@ -2225,7 +2441,12 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
         }
         if (heldFitSet) {
             var followed = PanFollow(heldFit, descByCoord, out anchored);
-            if (wantFit || anchored)
+            // A held fit is expressed in the camera pose where it was solved. If its live anchor is no
+            // longer available, PanFollow cannot tell whether the atlas has moved since then. Mixing that
+            // stale projection with live node centers produces detached route segments: the live target
+            // remains correct while remembered path nodes are drawn at their previous-screen locations.
+            // Blank estimated pieces until a current anchor confirms (and translates) the fit.
+            if (anchored)
                 transform = followed;
         }
         return transform;
@@ -2259,6 +2480,28 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
                     continue;
 
                 Graphics.DrawLine(start, end, Settings.LineWidth, estA || estB ? Faded(color, 170) : color);
+            }
+
+            // Diagnostic hop labels make the graph route auditable independently of the line geometry.
+            // In particular, a screenshot now shows whether a strange segment came from a wrong BFS node
+            // or from resolving the correct coordinate to the wrong screen position.
+            for (int i = 0; i < route.Path.Count; i++) {
+                var hop = route.Path[i];
+                if (hop == null
+                    || !TryNodeScreenPos(hop, descByCoord, transform, out Vector2 hopPos, out _, out _)
+                    || !IsOnScreen(hopPos))
+                    continue;
+                string hopName = string.IsNullOrWhiteSpace(hop.Name) ? "(unknown)" : hop.Name;
+                string role = i == 0 ? "seed" : i == route.Path.Count - 1 ? "target" : $"hop {i}";
+                string hopLabel = $"{role}: {hopName} [{hop.Coord.X}, {hop.Coord.Y}]";
+                DrawCenteredTextWithBackground(
+                    hopLabel,
+                    hopPos + new Vector2(0, 18),
+                    Settings.FontColor,
+                    Settings.BackgroundColor,
+                    true,
+                    8,
+                    3);
             }
         }
 
@@ -2403,6 +2646,33 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             return false;
 
         if (descByCoord.TryGetValue(n.Coord, out var d)) {
+            // Atlas icon elements are pooled as the camera moves. A description can remain in the list
+            // while its Element rect still points at an old screen location, so rect.Center is not an
+            // authoritative drawing position. Description3D is the node's persistent atlas-world
+            // position; projecting it through the atlas camera stays exact through pan and zoom.
+            try {
+                var world = d.Description3D;
+                var camera = AtlasPanel?.Camera;
+                if (world != null && camera != null) {
+                    pos = camera.WorldToScreen(world.Position);
+                    if (float.IsFinite(pos.X) && float.IsFinite(pos.Y)) {
+                        // Preserve the live icon's size when its rect agrees with the camera projection.
+                        // Otherwise use a conservative marker size; the position itself is still exact.
+                        try {
+                            var projectedRect = d.Element.GetClientRect();
+                            if (projectedRect.Right > projectedRect.Left
+                                && Vector2.DistanceSquared(projectedRect.Center, pos) < 64f * 64f)
+                                halfWidth = (projectedRect.Right - projectedRect.Left) / 2f;
+                        } catch { }
+                        if (halfWidth <= 0)
+                            halfWidth = 14f;
+                        return true;
+                    }
+                }
+            } catch { }
+
+            // Older framework builds may not expose Description3D/Camera. Retain the rect path as a
+            // compatibility fallback, with fitted projection below for a missing or zeroed element.
             try {
                 var rect = d.Element.GetClientRect();
                 var center = rect.Center;
@@ -3919,6 +4189,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
 
         if (multi) {
             DrawItinerary(route);
+            DrawPathDiagnostics(route);
             DrawOptionalDiagnostics(route);
             return;
         }
@@ -3958,6 +4229,7 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             }
         }
 
+        DrawPathDiagnostics(route);
         DrawOptionalDiagnostics(route);
 
         ImGui.Separator();
@@ -4025,6 +4297,26 @@ public class OptiPather : BaseSettingsPlugin<OptiPatherSettings>
             } finally {
                 ImGui.EndTable();
             }
+        }
+    }
+
+    private static void DrawPathDiagnostics(FinderResult route)
+    {
+        if (route.Path == null || route.Path.Count == 0)
+            return;
+
+        ImGui.TextDisabled($"Path ({route.Path.Count} nodes):");
+        for (int i = 0; i < route.Path.Count; i++) {
+            var node = route.Path[i];
+            if (node == null) {
+                ImGui.TextDisabled($"  {i}: (missing)");
+                continue;
+            }
+
+            string name = string.IsNullOrWhiteSpace(node.Name) ? "(unknown)" : node.Name;
+            string role = i == 0 ? "seed" : i == route.Path.Count - 1 ? "target" : $"hop {i}";
+            string state = node.Visited ? " visited" : node.Unlocked ? " unlocked" : "";
+            ImGui.TextUnformatted($"  {role}: {name} [{node.Coord.X}, {node.Coord.Y}]{state}");
         }
     }
 
